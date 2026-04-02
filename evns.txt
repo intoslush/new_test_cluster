@@ -1,0 +1,12 @@
+easydict 
+regex 
+prettytable
+ftfy 
+transformers<4.52.3
+timm
+ruamel.yaml
+scipy 
+scikit-learn 
+faiss-gpu
+numpy<2.0
+tensorboard
