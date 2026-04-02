@@ -9,4 +9,3 @@ scipy
 scikit-learn 
 faiss-gpu
 numpy<2.0
-tensorboard
