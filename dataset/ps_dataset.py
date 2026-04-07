@@ -60,6 +60,8 @@ class ps_train_dataset(Dataset):
 
         # 伪标签相关
         self.pseudo_labels = [-1] * len(self.pairs)
+        self.sample_confidences = [1.0] * len(self.pairs)
+        self.confidence_groups = [2] * len(self.pairs)
         self.valid_indices = list(range(len(self.pairs)))
         self.cluster2indices = defaultdict(list)  # 伪标签簇 -> [real_idx,...]
 
@@ -88,6 +90,19 @@ class ps_train_dataset(Dataset):
         for idx, c in enumerate(labels):
             if c != -1:
                 self.cluster2indices[c.item()].append(idx)
+
+    def set_sample_confidences(self, confidences, groups=None):
+        assert len(confidences) == len(self.pairs), (
+            f"confidence 数量{len(confidences)}和样本数量不一致{len(self.pairs)}"
+        )
+        self.sample_confidences = confidences
+        if groups is None:
+            self.confidence_groups = [2] * len(self.pairs)
+        else:
+            assert len(groups) == len(self.pairs), (
+                f"group 数量{len(groups)}和样本数量不一致{len(self.pairs)}"
+            )
+            self.confidence_groups = groups
 
 
 
@@ -205,7 +220,9 @@ class ps_train_dataset(Dataset):
             'person_id': person,
             'replace_flag': replace,
             'real_index': real_idx,
-            'pseudo_label': self.pseudo_labels[real_idx]
+            'pseudo_label': self.pseudo_labels[real_idx],
+            'confidence': self.sample_confidences[real_idx],
+            'confidence_group': self.confidence_groups[real_idx],
         }
 
 class ps_eval_dataset(Dataset):

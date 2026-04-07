@@ -22,6 +22,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 from my_model.xbert import BertConfig, BertForMaskedLM
+from utils.confidence import get_conf_calibration_cfg, normalize_weighted_mean
 from .mixins import (
     VisionBuilderMixin,
     MomentumMixin,
@@ -89,6 +90,7 @@ class ALBEF(VisionBuilderMixin, MomentumMixin, QueueMixin, MLMMixin, SaliencyMix
 
     def forward(self, batch, alpha, config, epoch):  # text2 是概率同一个 id 的其他图片描述, img1/img2 同一图不同增广
         loss_dict = {}
+        conf_cfg = get_conf_calibration_cfg(config)
         image1 = batch['image1']
         image2 = batch['image2']
         text1 = self.tokenizer(batch['caption1'], padding='longest', max_length=config['max_words'], return_tensors="pt").to(image1.device)
@@ -97,6 +99,9 @@ class ALBEF(VisionBuilderMixin, MomentumMixin, QueueMixin, MLMMixin, SaliencyMix
         idx = batch['person_id']
         replace = batch['replace_flag']
         idx = batch['pseudo_label']  # 覆盖为伪标签，保持原逻辑
+        confidence = batch.get('confidence')
+        if confidence is not None:
+            confidence = confidence.to(image1.device, dtype=torch.float32).view(-1)
 
         # extract image features
         image_embeds = self.visual_encoder(image1,register_blk=-1)
@@ -204,8 +209,19 @@ class ALBEF(VisionBuilderMixin, MomentumMixin, QueueMixin, MLMMixin, SaliencyMix
             sim_i2t = image_feat @ text_feat_all / self.temp  # [B, B(+Q)]
             sim_t2i = text_feat @ image_feat_all / self.temp  # [B, B(+Q)]
 
-            loss_i2t = -torch.sum(F.log_softmax(sim_i2t, dim=1) * sim_i2t_targets, dim=1).mean()
-            loss_t2i = -torch.sum(F.log_softmax(sim_t2i, dim=1) * sim_t2i_targets, dim=1).mean()
+            loss_i2t_per = -torch.sum(F.log_softmax(sim_i2t, dim=1) * sim_i2t_targets, dim=1)
+            loss_t2i_per = -torch.sum(F.log_softmax(sim_t2i, dim=1) * sim_t2i_targets, dim=1)
+            if (
+                bool(conf_cfg["enabled"])
+                and bool(conf_cfg["weight_metric_loss"])
+                and confidence is not None
+                and confidence.shape[0] == loss_i2t_per.shape[0]
+            ):
+                loss_i2t = normalize_weighted_mean(loss_i2t_per, confidence, eps=float(conf_cfg["eps"]))
+                loss_t2i = normalize_weighted_mean(loss_t2i_per, confidence, eps=float(conf_cfg["eps"]))
+            else:
+                loss_i2t = loss_i2t_per.mean()
+                loss_t2i = loss_t2i_per.mean()
             loss_dict['loss_cl'] = (loss_i2t + loss_t2i) / 2
 
             # -------- 4) 队列更新：只有 use_queue=True 才更新 --------

@@ -58,5 +58,19 @@ debug_mask_epoch: 20  #用来输出可视化的mask词的epoch
 mlm_soft_label: False
 debug_log_saliency: True  #用来输出可视化的mask词
 
+use_conf_calibration: False
+conf_alpha: 1.0
+conf_beta: 1.0
+conf_temp: 1.0
+conf_noise_value: 0.0
+conf_high_thres: 0.7
+conf_low_thres: 0.3
+conf_weight_id_loss: True
+conf_weight_metric_loss: False
+conf_use_text_prototype: True
+conf_debug_log: False
+conf_chunk_size: 4096
+conf_min_cluster_size: 1
+
 
 enable_itm_loss: True

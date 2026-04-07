@@ -4,12 +4,43 @@ import torch.distributed as dist
 import numpy as np
 from typing import Optional
 from collections import defaultdict
+from utils.confidence import compute_sample_confidence, get_conf_calibration_cfg
 
 try:
     from .cluster import cluster_begin_epoch
 except Exception:
     # 兼容直接放在同级目录的情形
     from .cluster import cluster_begin_epoch  # type: ignore
+
+
+def _bucketize_confidence(
+    confidence: torch.Tensor,
+    *,
+    high_thres: float,
+    low_thres: float,
+) -> torch.Tensor:
+    return torch.where(
+        confidence >= high_thres,
+        torch.full_like(confidence, 2, dtype=torch.long),
+        torch.where(confidence > low_thres, torch.full_like(confidence, 1, dtype=torch.long), torch.zeros_like(confidence, dtype=torch.long)),
+    )
+
+
+def _default_confidence_tensor(
+    *,
+    dataset_size: int,
+    device: torch.device,
+    raw_pseudo_np: Optional[np.ndarray],
+    noise_value: float,
+    high_thres: float,
+    low_thres: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    confidence = torch.ones((dataset_size,), dtype=torch.float32, device=device)
+    if raw_pseudo_np is not None:
+        raw_tensor = torch.tensor(raw_pseudo_np, dtype=torch.long, device=device)
+        confidence = torch.where(raw_tensor == -1, torch.full_like(confidence, float(noise_value)), confidence)
+    groups = _bucketize_confidence(confidence, high_thres=high_thres, low_thres=low_thres)
+    return confidence, groups
 
 def _replace_noise_with_unique_ids(pseudo_np: np.ndarray) -> np.ndarray:
     """
@@ -116,13 +147,26 @@ def generate_and_broadcast_pseudo_labels(
 ):
     """
     仅在 epoch < cluster_until_epoch 时进行聚类，并将结果广播到所有 rank。
-    返回：torch.LongTensor[dataset_size] (设备 device)
+    返回：dict，包含 pseudo_labels / sample_confidence / confidence_group
     """
+    conf_cfg = get_conf_calibration_cfg(config)
     dataset_size = len(cluster_loader.dataset)
     if epoch >= cluster_until_epoch:
         # 直接创建占位（-1）张量
         pseudo_labels = torch.full((dataset_size,), -1, dtype=torch.long, device=device)
-        return pseudo_labels
+        sample_confidence, confidence_group = _default_confidence_tensor(
+            dataset_size=dataset_size,
+            device=device,
+            raw_pseudo_np=np.full((dataset_size,), -1, dtype=np.int64),
+            noise_value=float(conf_cfg["noise_value"]),
+            high_thres=float(conf_cfg["high_thres"]),
+            low_thres=float(conf_cfg["low_thres"]),
+        )
+        return {
+            "pseudo_labels": pseudo_labels,
+            "sample_confidence": sample_confidence,
+            "confidence_group": confidence_group,
+        }
 
     cluster_loader.dataset.mode = 'cluster'
 
@@ -133,6 +177,7 @@ def generate_and_broadcast_pseudo_labels(
     if is_main:
         with torch.no_grad():
             raw_pseudo_np: Optional[np.ndarray] = None
+            confidence_feature_cache = None
 
             if str(cluster_id_mode).lower() == "instance":
                 # 不聚类：每个样本独立 id
@@ -144,9 +189,14 @@ def generate_and_broadcast_pseudo_labels(
                 # instance 模式下无 raw_for_metrics
             else:
                 # 正常聚类
-                raw_pseudo_np = cluster_begin_epoch(
+                cluster_result = cluster_begin_epoch(
                     cluster_loader, model, args, config, None, logger
                 )
+                if isinstance(cluster_result, dict):
+                    raw_pseudo_np = cluster_result.get("pseudo_labels")
+                    confidence_feature_cache = cluster_result.get("feature_cache")
+                else:
+                    raw_pseudo_np = cluster_result
                 final_pseudo_np, raw_for_metrics = apply_cluster_id_mode(
                     mode=cluster_id_mode,
                     dataset_size=dataset_size,
@@ -173,6 +223,59 @@ def generate_and_broadcast_pseudo_labels(
             image_pseudo_labels = torch.tensor(
                 final_pseudo_np, dtype=torch.long
             ).to(device, non_blocking=True)
+            sample_confidence, confidence_group = _default_confidence_tensor(
+                dataset_size=dataset_size,
+                device=device,
+                raw_pseudo_np=raw_for_metrics,
+                noise_value=float(conf_cfg["noise_value"]),
+                high_thres=float(conf_cfg["high_thres"]),
+                low_thres=float(conf_cfg["low_thres"]),
+            )
+
+            if bool(conf_cfg["enabled"]):
+                can_compute_conf = (
+                    raw_for_metrics is not None
+                    and confidence_feature_cache is not None
+                    and confidence_feature_cache.get("visual_features") is not None
+                    and confidence_feature_cache.get("text_features") is not None
+                    and len(confidence_feature_cache["visual_features"]) == dataset_size
+                    and len(confidence_feature_cache["text_features"]) == dataset_size
+                )
+                if can_compute_conf:
+                    confidence_result = compute_sample_confidence(
+                        visual_features=confidence_feature_cache["visual_features"].to(device, non_blocking=True),
+                        text_features=confidence_feature_cache["text_features"].to(device, non_blocking=True),
+                        pseudo_labels=torch.tensor(raw_for_metrics, dtype=torch.long, device=device),
+                        alpha=float(conf_cfg["alpha"]),
+                        beta=float(conf_cfg["beta"]),
+                        temp=float(conf_cfg["temp"]),
+                        noise_value=float(conf_cfg["noise_value"]),
+                        high_thres=float(conf_cfg["high_thres"]),
+                        low_thres=float(conf_cfg["low_thres"]),
+                        use_text_prototype=bool(conf_cfg["use_text_prototype"]),
+                        chunk_size=int(conf_cfg["chunk_size"]),
+                        min_cluster_size=int(conf_cfg["min_cluster_size"]),
+                        eps=float(conf_cfg["eps"]),
+                    )
+                    sample_confidence = confidence_result["confidence"].to(device, non_blocking=True)
+                    confidence_group = confidence_result["group"].to(device, non_blocking=True)
+
+                    if bool(conf_cfg["debug_log"]):
+                        logger.info(
+                            "[ConfCalib][epoch %d] mean=%.4f, min=%.4f, max=%.4f, core=%d, boundary=%d, unreliable=%d",
+                            epoch,
+                            float(sample_confidence.mean().item()),
+                            float(sample_confidence.min().item()),
+                            float(sample_confidence.max().item()),
+                            int((confidence_group == 2).sum().item()),
+                            int((confidence_group == 1).sum().item()),
+                            int((confidence_group == 0).sum().item()),
+                        )
+                else:
+                    logger.warning(
+                        "[ConfCalib][epoch %d] 跳过 confidence 计算：缺少原始聚类结果或 visual/text feature cache，回退为默认权重。",
+                        epoch,
+                    )
 
             # 可选：伪标签质量监控（建议用 raw_for_metrics）
             if hasattr(cluster_loader.dataset, 'pairs'):
@@ -224,12 +327,20 @@ def generate_and_broadcast_pseudo_labels(
     else:
         print(f"[Rank {rank}] 等待主进程生成伪标签")
         image_pseudo_labels = torch.empty(dataset_size, dtype=torch.long, device=device)
+        sample_confidence = torch.empty(dataset_size, dtype=torch.float32, device=device)
+        confidence_group = torch.empty(dataset_size, dtype=torch.long, device=device)
 
     if is_distributed:
         dist.broadcast(image_pseudo_labels, src=0)
+        dist.broadcast(sample_confidence, src=0)
+        dist.broadcast(confidence_group, src=0)
         dist.barrier()
 
     # 还原为 train 模式交由上层设置
     cluster_loader.dataset.mode = 'cluster'
 
-    return image_pseudo_labels
+    return {
+        "pseudo_labels": image_pseudo_labels,
+        "sample_confidence": sample_confidence,
+        "confidence_group": confidence_group,
+    }

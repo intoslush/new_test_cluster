@@ -34,6 +34,8 @@ if __name__ == "__main__":
         logger.info("Distributed training initialized")
 
     logger.info("Using %s GPUs", num_gpus)
+    if str(args.massage).strip():
+        logger.info("Experiment: %s", str(args.massage).strip())
     logger.info(str(args).replace(",", "\n"))
     save_train_configs(args.output_dir, args)
     model = build_model(args)

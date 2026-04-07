@@ -63,6 +63,25 @@ cluster_fusion_use_proj : False   # 保持“融合 CLS 原始特征”
 cluster_min_samples : 3
 cluster_eps : 0.6
 
+# Cross-Modal Confidence Calibration
+# 保持现有扁平配置风格；代码同时兼容 MODEL.USE_CONF_CALIBRATION 等写法
+# 已完成最小 GPU smoke test：
+# 1) 聚类 -> confidence calibration -> training -> evaluation 全链路可跑通
+# 2) 当前工程里真正会吃到 confidence 的是 pseudo-supervised contrastive loss
+#    因此实验时需要打开 conf_weight_metric_loss
+use_conf_calibration: True
+conf_alpha: 1.0
+conf_beta: 1.0
+conf_temp: 1.0
+conf_noise_value: 0.05
+conf_high_thres: 0.7
+conf_low_thres: 0.3
+conf_weight_id_loss: True
+conf_weight_metric_loss: True
+conf_use_text_prototype: True
+conf_debug_log: True
+conf_chunk_size: 4096
+conf_min_cluster_size: 1
+
 
 enable_itm_loss: True
-

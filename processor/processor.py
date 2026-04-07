@@ -81,7 +81,7 @@ def do_train(start_epoch, args, model, train_loader, evaluator, checkpointer, cl
             logger.info("========== [End dump] ==========")
 
         if epoch < 5 or epoch % 2 == 1:
-            image_pseudo_labels = generate_and_broadcast_pseudo_labels(
+            pseudo_cache = generate_and_broadcast_pseudo_labels(
                 epoch=epoch,
                 device=device,
                 is_main=is_main,
@@ -96,7 +96,11 @@ def do_train(start_epoch, args, model, train_loader, evaluator, checkpointer, cl
                 cluster_until_epoch=50,
             )
             train_loader.dataset.mode = "train"
-            train_loader.dataset.set_pseudo_labels(image_pseudo_labels.cpu())
+            train_loader.dataset.set_pseudo_labels(pseudo_cache["pseudo_labels"].cpu())
+            train_loader.dataset.set_sample_confidences(
+                pseudo_cache["sample_confidence"].cpu(),
+                pseudo_cache["confidence_group"].cpu(),
+            )
 
             if bool(config.get("reset_queue_each_epoch", True)):
                 if is_distributed:

@@ -5,6 +5,7 @@ import torch
 import torch.nn.functional as F
 
 from sklearn.cluster import DBSCAN  # 可选：如果内存允许、想用更快的 C 实现，可以开启下面的 sklearn 分支
+from utils.confidence import get_conf_calibration_cfg
 
 @torch.no_grad()
 def _infer_cluster_feat_dim(model_no_ddp, config, mode: str) -> int:
@@ -102,6 +103,40 @@ def extract_cluster_features(batch, model_no_ddp, tokenizer, config, device: tor
         return F.normalize(cls, dim=-1)
 
     raise ValueError(f"Unknown cluster_feature_mode: {mode}")
+
+
+@torch.no_grad()
+def extract_visual_text_features(
+    batch,
+    model_no_ddp,
+    tokenizer,
+    config,
+    device: torch.device,
+    text_key: str = "caption2",
+):
+    if tokenizer is None:
+        raise ValueError("tokenizer is required for confidence calibration feature extraction.")
+
+    image = batch["image1"].to(device, non_blocking=True)
+    image_embeds = model_no_ddp.visual_encoder(image)
+    visual_feat = F.normalize(model_no_ddp.vision_proj(image_embeds[:, 0, :]), dim=-1)
+
+    texts = batch[text_key]
+    text = tokenizer(
+        texts,
+        padding="longest",
+        max_length=int(config["max_words"]),
+        return_tensors="pt",
+        truncation=True,
+    ).to(device)
+    text_out = model_no_ddp.text_encoder.bert(
+        text["input_ids"],
+        attention_mask=text["attention_mask"],
+        return_dict=True,
+        mode="text",
+    )
+    text_feat = F.normalize(model_no_ddp.text_proj(text_out.last_hidden_state[:, 0, :]), dim=-1)
+    return visual_feat, text_feat
 
 
 def compute_jaccard_to_memmap(
@@ -270,6 +305,14 @@ def cluster_begin_epoch(train_loader, model, args, config, tokenizer=None, logge
     feat_dim = _infer_cluster_feat_dim(model_no_ddp, config, mode=str(config.get("cluster_feature_mode", "image")))
     # bank 放 GPU，float16 足够
     feat_bank = torch.empty((max_size, feat_dim), device=device, dtype=torch.float16)
+    conf_cfg = get_conf_calibration_cfg(config)
+    need_confidence_cache = bool(conf_cfg["enabled"])
+    visual_bank = None
+    text_bank = None
+    if need_confidence_cache:
+        embed_dim = int(model_no_ddp.vision_proj.out_features)
+        visual_bank = torch.empty((max_size, embed_dim), device=device, dtype=torch.float16)
+        text_bank = torch.empty((max_size, embed_dim), device=device, dtype=torch.float16)
 
     index = 0
 
@@ -294,11 +337,22 @@ def cluster_begin_epoch(train_loader, model, args, config, tokenizer=None, logge
     else:
         for i, batch in enumerate(train_loader):
             # 关键：按模式抽取 [B, D] 特征
-            feats = extract_cluster_features(batch, model_no_ddp, model.tokenizer, config, device)  # float32/16
+            feats = extract_cluster_features(batch, model_no_ddp, model_no_ddp.tokenizer, config, device)  # float32/16
             feats = feats.to(torch.float16)
 
             bs = feats.size(0)
             feat_bank[index:index + bs] = feats
+            if need_confidence_cache:
+                visual_feats, text_feats = extract_visual_text_features(
+                    batch,
+                    model_no_ddp,
+                    model_no_ddp.tokenizer,
+                    config,
+                    device,
+                    text_key=str(conf_cfg["text_key"]),
+                )
+                visual_bank[index:index + bs] = visual_feats.to(torch.float16)
+                text_bank[index:index + bs] = text_feats.to(torch.float16)
             index += bs
 
         # 可选保存（仅 rank0）
@@ -313,6 +367,13 @@ def cluster_begin_epoch(train_loader, model, args, config, tokenizer=None, logge
 
     # 2) 计算 jaccard 并写 memmap（只用已经填充的部分）
     feat_bank_used = feat_bank[:index].to(torch.float32)
+    confidence_feature_cache = None
+    if need_confidence_cache:
+        confidence_feature_cache = {
+            "visual_features": visual_bank[:index].cpu(),
+            "text_features": text_bank[:index].cpu(),
+        }
+        del visual_bank, text_bank
 
     if args.distributed:
         search_option = 2
@@ -371,4 +432,7 @@ def cluster_begin_epoch(train_loader, model, args, config, tokenizer=None, logge
     logger.info(f"聚类数（不含 -1）: {num_clusters}")
     logger.info(f"-1 数量: {num_noise}\n")
 
-    return image_pseudo_labels
+    return {
+        "pseudo_labels": image_pseudo_labels,
+        "feature_cache": confidence_feature_cache,
+    }
