@@ -42,6 +42,12 @@ def _default_confidence_tensor(
     groups = _bucketize_confidence(confidence, high_thres=high_thres, low_thres=low_thres)
     return confidence, groups
 
+
+def _full_dataset_size(dataset) -> int:
+    if hasattr(dataset, "pairs"):
+        return len(dataset.pairs)
+    return len(dataset)
+
 def _replace_noise_with_unique_ids(pseudo_np: np.ndarray) -> np.ndarray:
     """
     将 pseudo_np 中的 -1（噪声）替换为每个样本独立的 id。
@@ -150,7 +156,8 @@ def generate_and_broadcast_pseudo_labels(
     返回：dict，包含 pseudo_labels / sample_confidence / confidence_group
     """
     conf_cfg = get_conf_calibration_cfg(config)
-    dataset_size = len(cluster_loader.dataset)
+    cluster_loader.dataset.mode = "cluster"
+    dataset_size = _full_dataset_size(cluster_loader.dataset)
     if epoch >= cluster_until_epoch:
         # 直接创建占位（-1）张量
         pseudo_labels = torch.full((dataset_size,), -1, dtype=torch.long, device=device)
@@ -167,8 +174,6 @@ def generate_and_broadcast_pseudo_labels(
             "sample_confidence": sample_confidence,
             "confidence_group": confidence_group,
         }
-
-    cluster_loader.dataset.mode = 'cluster'
 
     # 新增：从 args 获取聚类 id 策略
     cluster_id_mode = getattr(args, "cluster_id_mode", "cluster")
@@ -201,6 +206,15 @@ def generate_and_broadcast_pseudo_labels(
                     mode=cluster_id_mode,
                     dataset_size=dataset_size,
                     raw_pseudo_np=raw_pseudo_np,
+                )
+
+            if len(final_pseudo_np) != dataset_size:
+                raise ValueError(
+                    f"伪标签长度与数据集长度不一致: pseudo={len(final_pseudo_np)}, dataset={dataset_size}"
+                )
+            if raw_for_metrics is not None and len(raw_for_metrics) != dataset_size:
+                raise ValueError(
+                    f"原始聚类结果长度与数据集长度不一致: raw={len(raw_for_metrics)}, dataset={dataset_size}"
                 )
 
             # 统计簇数：建议用 raw（含 -1），避免 unique_noise 把噪声当成大量新簇

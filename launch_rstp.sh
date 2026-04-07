@@ -1,18 +1,26 @@
 #!/bin/bash
 
+set -euo pipefail
+
 export CUDA_VISIBLE_DEVICES=0
 
-NUM_GPUS=$(echo $CUDA_VISIBLE_DEVICES | tr ',' '\n' | wc -l)
+NUM_GPUS=$(echo "$CUDA_VISIBLE_DEVICES" | tr ',' '\n' | wc -l)
 DATASET_NAME="RSTPReid"
+MASTER_PORT="${MASTER_PORT:-29505}"
 
-torchrun \
-  --nproc_per_node=${NUM_GPUS} \
-  --rdzv_backend=c10d \
-  --rdzv_endpoint=127.0.0.1:29505 \
-  train.py \
-  --name new_rasa \
-  --checkpoint ./data/ALBEF/ALBEF.pth \
-  --dataset_name $DATASET_NAME \
-  --root_dir ./re_id \
-  --num_epoch 30 \
+CMD=(
+  torchrun
+  --standalone
+  --nnodes=1
+  --nproc_per_node="${NUM_GPUS}"
+  --master-port="${MASTER_PORT}"
+  train.py
+  --name new_rasa
+  --checkpoint ./data/ALBEF/ALBEF.pth
+  --dataset_name "${DATASET_NAME}"
+  --root_dir ./re_id
+  --num_epoch 30
   --config ./configs/PS_rstp_reid.yaml
+)
+
+PYTHONUNBUFFERED=1 "${CMD[@]}"
