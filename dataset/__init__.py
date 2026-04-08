@@ -9,11 +9,14 @@ def get_dataloder(args):
     yaml = YAML.YAML(typ='rt') 
     config = yaml.load(open(args.config, 'r')) 
     train_dataset, val_dataset, test_dataset = create_dataset('ps', config)
-   
-    if args.distributed:
-        sampler = ValidIndexDistributedSampler(train_dataset, num_replicas=get_world_size(), rank=get_rank())
-    else:
-        sampler = None
+
+    sampler = ValidIndexDistributedSampler(
+        train_dataset,
+        num_replicas=get_world_size() if args.distributed else 1,
+        rank=get_rank() if args.distributed else 0,
+        batch_size=config['batch_size_train'],
+        num_instances=max(2, int(config.get('relation_sampler_instances', 2))),
+    )
 
     samplers = [sampler, None, None]
     #dataloader在这,然后logevery是直接迭代这个

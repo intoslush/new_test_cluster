@@ -80,5 +80,15 @@ conf_debug_log: True
 conf_chunk_size: 4096
 conf_min_cluster_size: 1
 
+use_relation_rectification: True
+relation_warmup_epochs: 1
+relation_mu: 0.5
+relation_gamma: 0.1
+relation_lambda: 0.5
+hard_neg_ratio: 0.25
+max_rel_pairs_per_id: 1
+detach_relation_weight: True
+relation_sampler_instances: 2
+
 
 enable_itm_loss: True
