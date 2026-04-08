@@ -1,14 +1,9 @@
 import torch
 
 class MLMMixin:
-    def mask(self, input_ids, vocab_size, targets=None, masked_indices=None, probability_matrix=None):
+    def mask(self, input_ids, vocab_size, targets=None, masked_indices=None):
         device = input_ids.device
-
-        # 概率矩阵与 input_ids 在同一设备
-        if probability_matrix is None:
-            prob = torch.full(input_ids.shape, self.mlm_probability, device=device, dtype=torch.float32)
-        else:
-            prob = probability_matrix.to(device=device, dtype=torch.float32)
+        prob = torch.full(input_ids.shape, self.mlm_probability, device=device, dtype=torch.float32)
 
         if masked_indices is None:
             masked_indices = torch.bernoulli(prob).to(dtype=torch.bool, device=device)

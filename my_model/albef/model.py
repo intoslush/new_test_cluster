@@ -12,9 +12,7 @@
 #       vision.py               # _build_vit
 #       momentum.py             # copy_params, _momentum_update
 #       queues.py               # _init_queues, _dequeue_and_enqueue, reset_queues, concat_all_gather
-#       mlm.py                  # mask
-#       saliency.py             # compute_cross_modal_saliency, build_curriculum_mask_probs
-#       debug_utils.py          # debug_render_mask_diff
+#       mlm.py                  # standard MLM mask
 #       infmask.py              # compute_infmask_loss
 # ──────────────────────────────────────────────────────────────────────────────
 from typing import Dict, Any
@@ -28,15 +26,12 @@ from .mixins import (
     MomentumMixin,
     QueueMixin,
     MLMMixin,
-    SaliencyMixin,
-    DebugMaskMixin,
     concat_all_gather,
-    SoftMaskITMMixin,
 )
 from .mixins.infmask import InfMaskMixin
 
 
-class ALBEF(VisionBuilderMixin, MomentumMixin, QueueMixin, MLMMixin, SaliencyMixin, DebugMaskMixin, InfMaskMixin,SoftMaskITMMixin, nn.Module):
+class ALBEF(VisionBuilderMixin, MomentumMixin, QueueMixin, MLMMixin, InfMaskMixin, nn.Module):
     def __init__(self, text_encoder=None, tokenizer=None, config: Dict[str, Any] = None):
         super().__init__()
         if config is None:
@@ -97,7 +92,6 @@ class ALBEF(VisionBuilderMixin, MomentumMixin, QueueMixin, MLMMixin, SaliencyMix
         text2 = self.tokenizer(batch['caption2'], padding='longest', max_length=config['max_words'], return_tensors="pt").to(image1.device)
         text_atts = text2['attention_mask']
         idx = batch['person_id']
-        replace = batch['replace_flag']
         idx = batch['pseudo_label']  # 覆盖为伪标签，保持原逻辑
         confidence = batch.get('confidence')
         if confidence is not None:
@@ -105,26 +99,6 @@ class ALBEF(VisionBuilderMixin, MomentumMixin, QueueMixin, MLMMixin, SaliencyMix
 
         # extract image features
         image_embeds = self.visual_encoder(image1,register_blk=-1)
-        # === 图像显著性：从 CLS→patch attention 中抽 ===
-        attn = self.visual_encoder.blocks[-1].attn.get_attention_map()
-        attn_mean = attn.mean(dim=1)              # [B, N, N]
-        patch_scores = attn_mean[:, 0, 1:]        # [B, P] CLS→所有 patch 的权重
-
-        B, P = patch_scores.shape
-        min_v = patch_scores.view(B, -1).min(dim=-1, keepdim=True)[0]
-        max_v = patch_scores.view(B, -1).max(dim=-1, keepdim=True)[0]
-        patch_scores = (patch_scores - min_v) / (max_v - min_v + 1e-6)  # [B, P] ∈ [0,1]
-
-        # 拼 CLS 的显著性（简单置 1），并 detach，防止梯度回流到 attn
-        saliency_image = torch.cat(
-            [
-                torch.ones(B, 1, device=image1.device, dtype=patch_scores.dtype),
-                patch_scores,
-            ],
-            dim=1,      # [B, 1+P]，和 image_embeds 的 token 数对齐
-        ).detach()
-        
-        
         image_atts = torch.ones(image_embeds.size()[:-1], dtype=torch.long).to(image1.device)
         image_feat = F.normalize(self.vision_proj(image_embeds[:, 0, :]), dim=-1)
 
@@ -231,36 +205,6 @@ class ALBEF(VisionBuilderMixin, MomentumMixin, QueueMixin, MLMMixin, SaliencyMix
                 else:
                     self._dequeue_and_enqueue(image_feat.detach(), text_feat.detach(), idx)
 
-        
-        # ===== Saliency compute =====
-        probability_matrix = None 
-        saliency_compute_epoch = config.get('saliency_compute_epoch', 5)
-        if epoch > saliency_compute_epoch :#and bool(config.get('enable_mlm_loss', False))
-            with torch.no_grad():
-                saliency = self.compute_cross_modal_groundedness(
-                    text_ids=text1['input_ids'],
-                    attention_mask=text1['attention_mask'],
-                    image_embeds=image_embeds,
-                    image_atts=image_atts,
-                    saliency_image=None,  # 用已有的 patch 显著性
-                    layers=int(config.get('saliency_layers', 3)),
-                    use_entropy=bool(config.get("grounded_use_entropy", True)),
-                    use_patch_saliency=bool(config.get("grounded_use_patch_saliency", False)),
-                )
-
-            probability_matrix = self.build_curriculum_mask_probs(
-                saliency=saliency,
-                attention_mask=text1['attention_mask'],
-                input_ids=text1['input_ids'],
-                base_prob=float(config.get('mlm_probability', self.mlm_probability)),
-                focus_top_p=float(config.get('mlm_focus_top_p', 0.3)),
-                p_strong=float(config.get('mlm_p_strong', 0.95)),
-                p_min=float(config.get('mlm_prob_min', 0.05)),
-                p_max=float(config.get('mlm_prob_max', 0.95)),
-            )            
-        else:
-            probability_matrix = None
-        
         # ===== Masked Language Modeling =====
         enable_mlm_loss = bool(config.get('enable_mlm_loss', False))
         enable_soft_label = bool(config.get('mlm_soft_label', False))
@@ -268,12 +212,10 @@ class ALBEF(VisionBuilderMixin, MomentumMixin, QueueMixin, MLMMixin, SaliencyMix
         if enable_mlm_loss:
             input_ids = text1.input_ids.clone()
             labels = input_ids.clone()
-            ids_before_debug = input_ids.clone()
             input_ids, labels = self.mask(
                 input_ids,
                 self.text_encoder.config.vocab_size,
                 targets=labels,
-                probability_matrix=probability_matrix  # 显著性引导的 mask 概率
             ) 
             if enable_soft_label:
                 with torch.no_grad():
@@ -307,31 +249,10 @@ class ALBEF(VisionBuilderMixin, MomentumMixin, QueueMixin, MLMMixin, SaliencyMix
                     return_dict=True,
                     labels=labels,
                 )
-            debug_epoch = int(config.get('debug_mask_epoch', 6))
-            if epoch > debug_epoch and bool(config.get("debug_log_saliency", True)):
-                
-                # 注意力方案的debug
-                self.debug_render_mask_with_norms(
-                    epoch=int(epoch),
-                    step=int(batch.get("global_step", 0)),   # 没有就传 n_iter/全局计数
-                    input_ids_before=ids_before_debug,
-                    input_ids_after=input_ids,
-                    targets=labels,
-                    attention_mask=text1['attention_mask'],
-                    probability_matrix=(probability_matrix if probability_matrix is not None else None),
-                    saliency_norm=saliency,
-                    raw_texts=batch.get('caption1', None),
-                    out_path=str(config.get("debug_mask_file", "./mask_output2.txt")),
-                    limit_per_epoch=int(config.get("debug_mask_limit_per_epoch", 30)),
-                    sample_per_step=int(config.get("debug_sample_per_step", 2)),
-                    topk_tokens=int(config.get("debug_topk_tokens", 8)),
-                    step_prob=float(config.get("debug_step_prob", 0.15)),
-                )
             loss_dict['loss_mlm'] = mlm_output.loss
 
         # ===== ITM (matched/unmatched) =====
         enable_itm_loss = bool(config.get('enable_itm_loss', False))
-        enable_itm_softmask = bool(config.get('enable_itm_softmask', False))
         if enable_itm_loss:
             # --- 学生：正样本 (text2, image1) ---
             output_pos = self.text_encoder.bert(
@@ -341,7 +262,6 @@ class ALBEF(VisionBuilderMixin, MomentumMixin, QueueMixin, MLMMixin, SaliencyMix
                 encoder_attention_mask=image_atts,
                 return_dict=True,
                 mode='fusion',
-                output_attentions=enable_itm_softmask,  # 只有 softmask 才开
                 output_hidden_states=False,
             )
             with torch.no_grad():

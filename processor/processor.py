@@ -6,13 +6,13 @@ from io import StringIO
 from typing import Any, Dict
 
 import torch
-import torch.distributed as dist
 from ruamel.yaml import YAML
 from torch.amp import GradScaler, autocast
 
 import utils.optimizer as utils
 from optim import create_optimizer
 from scheduler import create_scheduler
+from utils.comm import get_rank, is_main_process, synchronize
 
 from .eval_hooks import evaluate_and_checkpoint
 from .pseudo import generate_and_broadcast_pseudo_labels
@@ -32,8 +32,8 @@ def do_train(start_epoch, args, model, train_loader, evaluator, checkpointer, cl
     num_epoch = args.num_epoch
 
     is_distributed = args.distributed
-    rank = dist.get_rank() if is_distributed else 0
-    is_main = not is_distributed or rank == 0
+    rank = get_rank()
+    is_main = is_main_process()
 
     logger = logging.getLogger(args.name)
     logger.info("start training (rank %s)", rank)
@@ -53,7 +53,7 @@ def do_train(start_epoch, args, model, train_loader, evaluator, checkpointer, cl
     logger.info("Using AMP: %s", use_amp)
     scaler = GradScaler(enabled=use_amp)
 
-    model_without_ddp = model.module if is_distributed else model
+    model_without_ddp = model.module if hasattr(model, "module") else model
 
     os.makedirs(args.output_dir, exist_ok=True)
     os.makedirs(os.path.join(args.output_dir, "checkpoint"), exist_ok=True)
@@ -103,8 +103,7 @@ def do_train(start_epoch, args, model, train_loader, evaluator, checkpointer, cl
             )
 
             if bool(config.get("reset_queue_each_epoch", True)):
-                if is_distributed:
-                    dist.barrier()
+                synchronize()
                 model.reset_queues(random_init=bool(config.get("queue_random_reinit", False)))
                 if is_main:
                     logger.info(
@@ -112,11 +111,10 @@ def do_train(start_epoch, args, model, train_loader, evaluator, checkpointer, cl
                         rank,
                         bool(config.get("queue_random_reinit", False)),
                     )
-                if is_distributed:
-                    dist.barrier()
+                synchronize()
 
         if is_distributed:
-            dist.barrier()
+            synchronize()
             if hasattr(train_loader, "sampler") and hasattr(train_loader.sampler, "set_valid_indices"):
                 train_loader.sampler.set_valid_indices(train_loader.dataset.valid_indices)
             if hasattr(train_loader, "sampler") and hasattr(train_loader.sampler, "set_epoch"):
@@ -200,7 +198,7 @@ def do_train(start_epoch, args, model, train_loader, evaluator, checkpointer, cl
                     best_log = best_log_epoch
 
         if is_distributed:
-            dist.barrier()
+            synchronize()
 
         torch.cuda.empty_cache()
 

@@ -31,7 +31,7 @@ schedular: {sched: cosine, lr: 1e-5, epochs: 35, min_lr: 2e-6, decay_rate: 1, wa
 eval_epoch: 0
 
 
-weights: {"loss_cl": 0.5, "loss_itm": 1, "loss_mlm": 1, "loss_prd": 0.5, "loss_mrtd": 0.5,"loss_sim": 0.5, "loss_itm_softmask": 1}
+weights: {"loss_cl": 0.5, "loss_itm": 1, "loss_mlm": 1, "loss_prd": 0.5, "loss_mrtd": 0.5,"loss_sim": 0.5}
 # 新增的权重调度配置
 weights_schedule:
   freeze_epochs: 40     # 前 20 个 epoch 不变
@@ -52,10 +52,7 @@ enable_cl_loss: True
 itm_neg_sampling  : 'cl' # 一个参数决定采样方式：'cl' or 'random'，如果关cl需要改为random
 
 enable_mlm_loss:  True
-saliency_compute_epoch: 10 #计算saliency的epoch
-debug_mask_epoch: 10  #用来输出可视化的mask词的epoch
 mlm_soft_label: False
-debug_log_saliency: False  #用来输出可视化的mask词
 
 cluster_feature_mode : "image"
 cluster_fusion_use_proj : False   # 保持“融合 CLS 原始特征”

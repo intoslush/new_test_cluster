@@ -30,7 +30,7 @@ schedular: {sched: cosine, lr: 1e-5, epochs: 1, min_lr: 2e-6, decay_rate: 1, war
 
 eval_epoch: 999
 
-weights: {"loss_cl": 1.0, "loss_itm": 0.0, "loss_mlm": 0.0, "loss_prd": 0.0, "loss_mrtd": 0.0, "loss_sim": 0.0, "loss_itm_softmask": 0.0}
+weights: {"loss_cl": 1.0, "loss_itm": 0.0, "loss_mlm": 0.0, "loss_prd": 0.0, "loss_mrtd": 0.0, "loss_sim": 0.0}
 use_queue: False
 reset_queue_each_epoch: False
 enable_cl_loss: True
@@ -38,7 +38,6 @@ itm_neg_sampling: 'random'
 
 enable_mlm_loss: False
 mlm_soft_label: False
-debug_log_saliency: False
 cluster_feature_mode: 'image'
 cluster_min_samples: 2
 cluster_eps: 0.6
