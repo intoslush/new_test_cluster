@@ -30,7 +30,7 @@ schedular: {sched: cosine, lr: 1e-5, epochs: 1, min_lr: 2e-6, decay_rate: 1, war
 
 eval_epoch: 999
 
-weights: {"loss_cl": 1.0, "loss_itm": 0.0, "loss_mlm": 0.0, "loss_prd": 0.0, "loss_mrtd": 0.0, "loss_sim": 0.0}
+weights: {"loss_cl": 1.0, "loss_itm": 0.0, "loss_neg": 0.0, "loss_mlm": 0.0, "loss_prd": 0.0, "loss_mrtd": 0.0, "loss_sim": 0.0}
 use_queue: False
 reset_queue_each_epoch: False
 enable_cl_loss: True
@@ -60,11 +60,9 @@ cluster_k1: 3
 cluster_k2: 2
 
 use_relation_rectification: True
-relation_warmup_epochs: 1
+relation_warmup_epochs: 6
 relation_mu: 0.5
 relation_gamma: 0.1
-relation_lambda: 0.5
-hard_neg_ratio: 0.25
-max_rel_pairs_per_id: 1
+relation_lambda: 0.1
+neg_weight_gamma: 1.0
 detach_relation_weight: True
-relation_sampler_instances: 2

@@ -31,7 +31,7 @@ schedular: {sched: cosine, lr: 1e-5, epochs: 35, min_lr: 2e-6, decay_rate: 1, wa
 eval_epoch: 0
 
 
-weights: {"loss_cl": 0.5, "loss_itm": 1, "loss_mlm": 1, "loss_prd": 0.5, "loss_mrtd": 0.5,"loss_sim": 0.5}
+weights: {"loss_cl": 0.5, "loss_itm": 1, "loss_neg": 0, "loss_mlm": 1}
 # 新增的权重调度配置
 weights_schedule:
   freeze_epochs: 40     # 前 20 个 epoch 不变
@@ -81,14 +81,12 @@ conf_chunk_size: 4096
 conf_min_cluster_size: 1
 
 use_relation_rectification: True
-relation_warmup_epochs: 1
+relation_warmup_epochs: 6
 relation_mu: 0.5
 relation_gamma: 0.1
-relation_lambda: 0.5
-hard_neg_ratio: 0.25
-max_rel_pairs_per_id: 1
+relation_lambda: 0.1
+neg_weight_gamma: 1.0
 detach_relation_weight: True
-relation_sampler_instances: 2
 
 
 enable_itm_loss: True

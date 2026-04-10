@@ -41,6 +41,8 @@ def do_train(start_epoch, args, model, train_loader, evaluator, checkpointer, cl
     yaml = YAML(typ="rt")
     with open(args.config, "r", encoding="utf-8") as config_file:
         config = yaml.load(config_file)
+    config.setdefault("weights", {})
+    config["weights"].setdefault("loss_neg", 0.0)
 
     optimizer, scheduler = _setup_optim_sched(config, model)
 
@@ -160,12 +162,14 @@ def do_train(start_epoch, args, model, train_loader, evaluator, checkpointer, cl
                 relation_stats = getattr(model_without_ddp, "latest_relation_stats", None)
                 if relation_stats is not None:
                     logger.info(
-                        "[Relation][epoch %s batch %s] active=%s verified_pairs=%d hard_negs=%d q_aa=%.4f q_ab=%.4f r_ab=%.4f g_ab=%.4f",
+                        "[Relation][epoch %s batch %s] active=%s verified_pairs=%d neg_pairs=%d neg_w=%.4f neg_loss=%.4f q_aa=%.4f q_ab=%.4f r_ab=%.4f g_ab=%.4f",
                         epoch,
                         n_iter,
                         int(relation_stats.get("active", 0.0) > 0),
                         int(relation_stats.get("num_verified_pairs", 0.0)),
-                        int(relation_stats.get("num_hard_negatives", 0.0)),
+                        int(relation_stats.get("num_neg_pairs", 0.0)),
+                        float(relation_stats.get("mean_neg_weight", 0.0)),
+                        float(relation_stats.get("loss_neg", 0.0)),
                         float(relation_stats.get("mean_q_aa", 0.0)),
                         float(relation_stats.get("mean_q_ab", 0.0)),
                         float(relation_stats.get("mean_r_ab", 0.0)),
