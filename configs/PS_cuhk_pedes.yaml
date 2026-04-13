@@ -80,10 +80,5 @@ conf_debug_log: True
 conf_chunk_size: 4096
 conf_min_cluster_size: 1
 
-use_relation_rectification: True
-relation_warmup_epochs: 6
-relation_ratio_threshold: 0.9
-relation_self_threshold: 0.5
-
-
+lambda_amb: 0.1
 enable_itm_loss: True

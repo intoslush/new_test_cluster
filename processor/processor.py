@@ -157,19 +157,15 @@ def do_train(start_epoch, args, model, train_loader, evaluator, checkpointer, cl
                     loss = loss + weight * v
 
             if n_iter % args.log_period == 0:
-                relation_stats = getattr(model_without_ddp, "latest_relation_stats", None)
-                if relation_stats is not None:
+                ambiguous_stats = getattr(model_without_ddp, "latest_ambiguous_stats", None)
+                if ambiguous_stats is not None:
                     logger.info(
-                        "[Relation][epoch %s batch %s] active=%s verified_pairs=%d q_aa=%.4f q_ab=%.4f rel_ab=%.4f rel_ba=%.4f self_min=%.4f",
+                        "[Ambiguous][epoch %s batch %s] active=%s pairs=%d loss=%.4f",
                         epoch,
                         n_iter,
-                        int(relation_stats.get("active", 0.0) > 0),
-                        int(relation_stats.get("num_verified_pairs", 0.0)),
-                        float(relation_stats.get("mean_q_aa", 0.0)),
-                        float(relation_stats.get("mean_q_ab", 0.0)),
-                        float(relation_stats.get("mean_rel_ab", 0.0)),
-                        float(relation_stats.get("mean_rel_ba", 0.0)),
-                        float(relation_stats.get("mean_self_min", 0.0)),
+                        int(ambiguous_stats.get("active", 0.0) > 0),
+                        int(ambiguous_stats.get("num_pairs", 0.0)),
+                        float(ambiguous_stats.get("loss", 0.0)),
                     )
 
             optimizer.zero_grad(set_to_none=True)

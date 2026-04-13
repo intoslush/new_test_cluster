@@ -32,16 +32,6 @@ from .mixins import (
 from .mixins.infmask import InfMaskMixin
 
 
-def get_relation_rectification_cfg(config: Dict[str, Any]) -> Dict[str, Any]:
-    return {
-        "enabled": bool(config.get("use_relation_rectification", True)),
-        "warmup_epochs": int(config.get("relation_warmup_epochs", 6)),
-        "ratio_threshold": float(config.get("relation_ratio_threshold", 0.9)),
-        "self_threshold": float(config.get("relation_self_threshold", 0.5)),
-        "eps": float(config.get("relation_eps", 1e-6)),
-    }
-
-
 class ALBEF(VisionBuilderMixin, MomentumMixin, QueueMixin, MLMMixin, InfMaskMixin, nn.Module):
     def __init__(self, text_encoder=None, tokenizer=None, config: Dict[str, Any] = None):
         super().__init__()
@@ -93,21 +83,16 @@ class ALBEF(VisionBuilderMixin, MomentumMixin, QueueMixin, MLMMixin, InfMaskMixi
         self.copy_params()
         # Queues
         self._init_queues(embed_dim)
-        self.latest_relation_stats = self._init_relation_stats(active=False)
-        self.latest_relation_debug = {}
+        self.latest_ambiguous_stats = self._init_ambiguous_stats(active=False)
 
-    def _init_relation_stats(self, active: bool) -> Dict[str, float]:
+    def _init_ambiguous_stats(self, active: bool) -> Dict[str, float]:
         return {
             "active": float(active),
-            "mean_q_aa": 0.0,
-            "mean_q_ab": 0.0,
-            "mean_rel_ab": 0.0,
-            "mean_rel_ba": 0.0,
-            "mean_self_min": 0.0,
-            "num_verified_pairs": 0.0,
+            "num_pairs": 0.0,
+            "loss": 0.0,
         }
 
-    def _build_relation_pairs(
+    def _sample_ambiguous_pairs(
         self,
         pseudo_labels: torch.Tensor,
     ) -> Optional[torch.Tensor]:
@@ -122,127 +107,60 @@ class ALBEF(VisionBuilderMixin, MomentumMixin, QueueMixin, MLMMixin, InfMaskMixi
         for members in groups.values():
             if len(members) < 2:
                 continue
-            member_tensor = torch.tensor(members, dtype=torch.long, device=labels.device)
-            pairs.append(torch.combinations(member_tensor, r=2))
+            order = torch.randperm(len(members), device=labels.device).tolist()
+            shuffled_members = [members[i] for i in order]
+            # Keep the extra ITM cost bounded by sampling disjoint same-cluster pairs.
+            for start in range(0, len(shuffled_members) - 1, 2):
+                pairs.append([shuffled_members[start], shuffled_members[start + 1]])
 
         if not pairs:
             return None
-        return torch.cat(pairs, dim=0)
+        return torch.tensor(pairs, dtype=torch.long, device=labels.device)
 
-    def _compute_itm_positive_prob(
+    def _compute_ambiguous_ranking_loss(
         self,
         image_embeds: torch.Tensor,
         image_atts: torch.Tensor,
         text_embeds: torch.Tensor,
         text_atts: torch.Tensor,
+        positive_matched_logits: torch.Tensor,
+        ambiguous_pairs: Optional[torch.Tensor],
         fusion_encoder,
         itm_head,
     ) -> torch.Tensor:
+        if ambiguous_pairs is None or ambiguous_pairs.numel() == 0:
+            return positive_matched_logits.new_zeros(())
+
+        a_idx = ambiguous_pairs[:, 0]
+        b_idx = ambiguous_pairs[:, 1]
+        image_idx = torch.cat([a_idx, b_idx], dim=0)
+        text_idx = torch.cat([b_idx, a_idx], dim=0)
+
+        # Same pseudo-ID cross pairs stay outside the hard-negative pool.
+        # We only ask the original matched pair to score higher than one in-cluster cross pair.
         output = fusion_encoder.bert(
-            encoder_embeds=text_embeds,
-            attention_mask=text_atts,
-            encoder_hidden_states=image_embeds,
-            encoder_attention_mask=image_atts,
+            encoder_embeds=text_embeds[text_idx],
+            attention_mask=text_atts[text_idx],
+            encoder_hidden_states=image_embeds[image_idx],
+            encoder_attention_mask=image_atts[image_idx],
             return_dict=True,
             mode='fusion',
             output_hidden_states=False,
         )
-        logits = itm_head(output.last_hidden_state[:, 0, :].float())
-        return F.softmax(logits, dim=-1)[:, 1]
+        matched_logits = itm_head(output.last_hidden_state[:, 0, :].float())[:, 1]
 
-    def _compute_relation_scores(
-        self,
-        image_embeds: torch.Tensor,
-        image_atts: torch.Tensor,
-        text_embeds: torch.Tensor,
-        text_atts: torch.Tensor,
-        relation_pairs: torch.Tensor,
-        relation_cfg: Dict[str, Any],
-        fusion_encoder,
-        itm_head,
-    ) -> Dict[str, torch.Tensor]:
-        a_idx = relation_pairs[:, 0]
-        b_idx = relation_pairs[:, 1]
-        image_idx = torch.cat([a_idx, a_idx, b_idx, b_idx], dim=0)
-        text_idx = torch.cat([a_idx, b_idx, a_idx, b_idx], dim=0)
+        num_pairs = ambiguous_pairs.shape[0]
+        z_ij = matched_logits[:num_pairs]
+        z_ji = matched_logits[num_pairs:]
+        z_ii = positive_matched_logits[a_idx]
+        z_jj = positive_matched_logits[b_idx]
 
-        q_all = self._compute_itm_positive_prob(
-            image_embeds=image_embeds[image_idx],
-            image_atts=image_atts[image_idx],
-            text_embeds=text_embeds[text_idx],
-            text_atts=text_atts[text_idx],
-            fusion_encoder=fusion_encoder,
-            itm_head=itm_head,
-        )
-
-        num_pairs = relation_pairs.shape[0]
-        q_aa = q_all[:num_pairs]
-        q_ab = q_all[num_pairs: 2 * num_pairs]
-        q_ba = q_all[2 * num_pairs: 3 * num_pairs]
-        q_bb = q_all[3 * num_pairs:]
-
-        eps = float(relation_cfg["eps"])
-        rel_ab = q_ab / (q_aa + eps)
-        rel_ba = q_ba / (q_bb + eps)
-        rel_min = torch.minimum(rel_ab, rel_ba)
-        self_min = torch.minimum(q_aa, q_bb)
-
-        return {
-            "pairs": relation_pairs,
-            "q_aa": q_aa,
-            "q_ab": q_ab,
-            "q_ba": q_ba,
-            "q_bb": q_bb,
-            "rel_ab": rel_ab,
-            "rel_ba": rel_ba,
-            "rel_min": rel_min,
-            "self_min": self_min,
-        }
-
-    def _select_verified_relation_pairs(
-        self,
-        relation_info: Optional[Dict[str, torch.Tensor]],
-        relation_cfg: Dict[str, Any],
-    ) -> Optional[Dict[str, torch.Tensor]]:
-        if relation_info is None or relation_info["pairs"].numel() == 0:
-            return None
-
-        verified_mask = (
-            (relation_info["rel_min"] >= float(relation_cfg["ratio_threshold"]))
-            & (relation_info["self_min"] >= float(relation_cfg["self_threshold"]))
-        )
-        if not torch.any(verified_mask):
-            return None
-
-        return {
-            "pairs": relation_info["pairs"][verified_mask],
-            "ratio_scores": relation_info["rel_min"][verified_mask],
-            "self_scores": relation_info["self_min"][verified_mask],
-        }
-
-    def _build_itm_negative_sampling_mask(
-        self,
-        batch_size: int,
-        device: torch.device,
-        verified_pairs: Optional[torch.Tensor],
-    ) -> torch.Tensor:
-        exclude_mask = torch.eye(batch_size, device=device, dtype=torch.bool)
-        if verified_pairs is None or verified_pairs.numel() == 0:
-            return exclude_mask
-
-        a_idx = verified_pairs[:, 0]
-        b_idx = verified_pairs[:, 1]
-        exclude_mask[a_idx, b_idx] = True
-        exclude_mask[b_idx, a_idx] = True
-        return exclude_mask
+        loss = 0.5 * (F.softplus(z_ij - z_ii) + F.softplus(z_ji - z_jj))
+        return loss.mean()
 
     def forward(self, batch, alpha, config, epoch):  # text2 是概率同一个 id 的其他图片描述, img1/img2 同一图不同增广
         loss_dict = {}
         conf_cfg = get_conf_calibration_cfg(config)
-        relation_cfg = get_relation_rectification_cfg(config)
-        relation_active = bool(relation_cfg["enabled"]) and int(epoch) >= int(relation_cfg["warmup_epochs"])
-        self.latest_relation_stats = self._init_relation_stats(active=relation_active)
-        self.latest_relation_debug = {}
         image1 = batch['image1']
         image2 = batch['image2']
         text1 = self.tokenizer(batch['caption1'], padding='longest', max_length=config['max_words'], return_tensors="pt").to(image1.device)
@@ -250,6 +168,8 @@ class ALBEF(VisionBuilderMixin, MomentumMixin, QueueMixin, MLMMixin, InfMaskMixi
         text_atts = text2['attention_mask']
         idx = batch['person_id']
         idx = batch['pseudo_label']  # 覆盖为伪标签，保持原逻辑
+        lambda_amb = float(config.get("lambda_amb", 0.1))
+        self.latest_ambiguous_stats = self._init_ambiguous_stats(active=False)
         confidence = batch.get('confidence')
         if confidence is not None:
             confidence = confidence.to(image1.device, dtype=torch.float32).view(-1)
@@ -264,12 +184,6 @@ class ALBEF(VisionBuilderMixin, MomentumMixin, QueueMixin, MLMMixin, InfMaskMixi
         text_embeds = text_output.last_hidden_state
         text_feat = F.normalize(self.text_proj(text_embeds[:, 0, :]), dim=-1)
 
-        relation_info = None
-        relation_pairs = None
-        verified_relation_pairs = None
-        if relation_active:
-            relation_pairs = self._build_relation_pairs(idx.view(-1))
-        
         # ===== Contrastive loss =====
         enable_cl_loss = bool(config.get('enable_cl_loss', True))
         use_momentum   = bool(config.get('use_momentum', True))   # 是否用动量分支
@@ -296,7 +210,6 @@ class ALBEF(VisionBuilderMixin, MomentumMixin, QueueMixin, MLMMixin, InfMaskMixi
 
                     image_embeds_m = self.visual_encoder_m(image2)
                     image_feat_m = F.normalize(self.vision_proj_m(image_embeds_m[:, 0, :]), dim=-1)
-                    image_embeds_rel = self.visual_encoder_m(image1)
 
                     text_output_m = self.text_encoder_m.bert(
                         text2['input_ids'],
@@ -304,7 +217,6 @@ class ALBEF(VisionBuilderMixin, MomentumMixin, QueueMixin, MLMMixin, InfMaskMixi
                         return_dict=True,
                         mode='text'
                     )
-                    text_embeds_rel = text_output_m.last_hidden_state
                     text_feat_m = F.normalize(self.text_proj_m(text_output_m.last_hidden_state[:, 0, :]), dim=-1)
 
                     if use_queue:
@@ -320,18 +232,6 @@ class ALBEF(VisionBuilderMixin, MomentumMixin, QueueMixin, MLMMixin, InfMaskMixi
                     sim_i2t_m_targets = F.softmax(sim_i2t_m, dim=1)
                     sim_t2i_m_targets = F.softmax(sim_t2i_m, dim=1)
 
-                    if relation_active and relation_pairs is not None and relation_pairs.numel() > 0:
-                        relation_info = self._compute_relation_scores(
-                            image_embeds=image_embeds_rel,
-                            image_atts=image_atts,
-                            text_embeds=text_embeds_rel,
-                            text_atts=text_atts,
-                            relation_pairs=relation_pairs,
-                            relation_cfg=relation_cfg,
-                            fusion_encoder=self.text_encoder_m,
-                            itm_head=self.itm_head_m,
-                        )
-
                 else:
                     # 非动量：targets 直接用 sim_targets（你当前就是这么做的）
                     if use_queue:
@@ -342,24 +242,6 @@ class ALBEF(VisionBuilderMixin, MomentumMixin, QueueMixin, MLMMixin, InfMaskMixi
                         text_feat_all  = text_feat.detach().t()
                     sim_i2t_m_targets = None
                     sim_t2i_m_targets = None
-
-                    if relation_active and relation_pairs is not None and relation_pairs.numel() > 0:
-                        relation_info = self._compute_relation_scores(
-                            image_embeds=image_embeds,
-                            image_atts=image_atts,
-                            text_embeds=text_embeds,
-                            text_atts=text_atts,
-                            relation_pairs=relation_pairs,
-                            relation_cfg=relation_cfg,
-                            fusion_encoder=self.text_encoder,
-                            itm_head=self.itm_head,
-                        )
-
-            if relation_info is not None:
-                verified_relation_pairs = self._select_verified_relation_pairs(
-                    relation_info=relation_info,
-                    relation_cfg=relation_cfg,
-                )
 
             if sim_i2t_m_targets is not None and sim_t2i_m_targets is not None:
                 sim_i2t_targets = alpha * sim_i2t_m_targets + (1 - alpha) * sim_targets
@@ -406,48 +288,6 @@ class ALBEF(VisionBuilderMixin, MomentumMixin, QueueMixin, MLMMixin, InfMaskMixi
                     self._dequeue_and_enqueue(image_feat_m, text_feat_m, idx)
                 else:
                     self._dequeue_and_enqueue(image_feat.detach(), text_feat.detach(), idx)
-
-        if relation_info is None and relation_active and relation_pairs is not None and relation_pairs.numel() > 0:
-            with torch.no_grad():
-                relation_info = self._compute_relation_scores(
-                    image_embeds=image_embeds,
-                    image_atts=image_atts,
-                    text_embeds=text_embeds,
-                    text_atts=text_atts,
-                    relation_pairs=relation_pairs,
-                    relation_cfg=relation_cfg,
-                    fusion_encoder=self.text_encoder,
-                    itm_head=self.itm_head,
-                )
-                verified_relation_pairs = self._select_verified_relation_pairs(
-                    relation_info=relation_info,
-                    relation_cfg=relation_cfg,
-                )
-
-        if relation_info is not None:
-            self.latest_relation_stats.update(
-                {
-                    "mean_q_aa": float(relation_info["q_aa"].detach().mean().item()),
-                    "mean_q_ab": float(relation_info["q_ab"].detach().mean().item()),
-                    "mean_rel_ab": float(relation_info["rel_ab"].detach().mean().item()),
-                    "mean_rel_ba": float(relation_info["rel_ba"].detach().mean().item()),
-                    "mean_self_min": float(relation_info["self_min"].detach().mean().item()),
-                    "num_verified_pairs": float(
-                        0 if verified_relation_pairs is None else verified_relation_pairs["pairs"].shape[0]
-                    ),
-                }
-            )
-            self.latest_relation_debug = {
-                "pairs": relation_info["pairs"].detach(),
-                "q_aa": relation_info["q_aa"].detach(),
-                "q_ab": relation_info["q_ab"].detach(),
-                "q_ba": relation_info["q_ba"].detach(),
-                "q_bb": relation_info["q_bb"].detach(),
-                "rel_ab": relation_info["rel_ab"].detach(),
-                "rel_ba": relation_info["rel_ba"].detach(),
-                "rel_min": relation_info["rel_min"].detach(),
-                "self_min": relation_info["self_min"].detach(),
-            }
 
         # ===== Masked Language Modeling =====
         enable_mlm_loss = bool(config.get('enable_mlm_loss', False))
@@ -508,6 +348,7 @@ class ALBEF(VisionBuilderMixin, MomentumMixin, QueueMixin, MLMMixin, InfMaskMixi
                 mode='fusion',
                 output_hidden_states=False,
             )
+            pos_vl_output = self.itm_head(output_pos.last_hidden_state[:, 0, :].float())
             with torch.no_grad():
                 bs = image1.size(0)
                 itm_neg_sampling = str(config.get("itm_neg_sampling", "cl")).lower()
@@ -515,14 +356,9 @@ class ALBEF(VisionBuilderMixin, MomentumMixin, QueueMixin, MLMMixin, InfMaskMixi
                     raise ValueError(f"config['itm_neg_sampling'] must be 'cl' or 'random', got {itm_neg_sampling}")
 
                 idx_1d = idx.view(-1)  # [B]
-                if relation_active:
-                    mask_exclude = self._build_itm_negative_sampling_mask(
-                        batch_size=bs,
-                        device=image1.device,
-                        verified_pairs=None if verified_relation_pairs is None else verified_relation_pairs["pairs"],
-                    )
-                else:
-                    mask_exclude = torch.eq(idx_1d.view(bs, 1), idx_1d.view(1, bs))  # [B,B]
+                # Same pseudo-ID cross pairs are handled by the ranking loss, not by hard-negative ITM labels.
+                mask_exclude = torch.eq(idx_1d.view(bs, 1), idx_1d.view(1, bs))  # [B,B]
+                neg_anchor_idx = (~mask_exclude).any(dim=1).nonzero(as_tuple=False).view(-1)
 
                 if itm_neg_sampling == "cl":
                     # 沿用原本：按 CL 相似度分布采样
@@ -536,71 +372,81 @@ class ALBEF(VisionBuilderMixin, MomentumMixin, QueueMixin, MLMMixin, InfMaskMixi
                     weights_i2t.masked_fill_(mask_exclude, 0.0)
                     weights_t2i.masked_fill_(mask_exclude, 0.0)
 
-                    # 兜底：若某行全 0（极端情况下同 id 太多），退化为随机（排除自身）
-                    if (weights_i2t.sum(dim=1) == 0).any():
-                        w = (~torch.eye(bs, device=image1.device, dtype=torch.bool)).float()
-                        weights_i2t = w / (w.sum(dim=1, keepdim=True) + 1e-12)
-                    else:
+                    if neg_anchor_idx.numel() > 0:
+                        weights_i2t = weights_i2t[neg_anchor_idx]
+                        weights_t2i = weights_t2i[neg_anchor_idx]
                         weights_i2t = weights_i2t / (weights_i2t.sum(dim=1, keepdim=True) + 1e-12)
-
-                    if (weights_t2i.sum(dim=1) == 0).any():
-                        w = (~torch.eye(bs, device=image1.device, dtype=torch.bool)).float()
-                        weights_t2i = w / (w.sum(dim=1, keepdim=True) + 1e-12)
-                    else:
                         weights_t2i = weights_t2i / (weights_t2i.sum(dim=1, keepdim=True) + 1e-12)
-
-                    image_neg_idx = torch.multinomial(weights_t2i, 1).squeeze(1)  # [B]
-                    text_neg_idx  = torch.multinomial(weights_i2t, 1).squeeze(1)  # [B]
+                        image_neg_idx = torch.multinomial(weights_t2i, 1).squeeze(1)  # [N]
+                        text_neg_idx  = torch.multinomial(weights_i2t, 1).squeeze(1)  # [N]
+                    else:
+                        image_neg_idx = torch.empty(0, dtype=torch.long, device=image1.device)
+                        text_neg_idx  = torch.empty(0, dtype=torch.long, device=image1.device)
 
                 else:
                     # random：均匀随机采样，排除同 id（含自身）
                     valid = (~mask_exclude).float()  # [B,B]
-                    row_sum = valid.sum(dim=1, keepdim=True)
+                    if neg_anchor_idx.numel() > 0:
+                        valid = valid[neg_anchor_idx]
+                        probs = valid / (valid.sum(dim=1, keepdim=True) + 1e-12)
+                        image_neg_idx = torch.multinomial(probs, 1).squeeze(1)  # [N]
+                        text_neg_idx  = torch.multinomial(probs, 1).squeeze(1)  # [N]
+                    else:
+                        image_neg_idx = torch.empty(0, dtype=torch.long, device=image1.device)
+                        text_neg_idx  = torch.empty(0, dtype=torch.long, device=image1.device)
 
-                    # 若某行无可选（整批同 id），退化为排除自身
-                    if (row_sum == 0).any():
-                        valid_fallback = (~torch.eye(bs, device=image1.device, dtype=torch.bool)).float()
-                        valid = torch.where(row_sum > 0, valid, valid_fallback)
-                        row_sum = valid.sum(dim=1, keepdim=True)
+            if neg_anchor_idx.numel() > 0:
+                image_embeds_neg = image_embeds[image_neg_idx]
+                image_atts_neg = image_atts[image_neg_idx]
+                text_embeds_neg = text_embeds[text_neg_idx]
+                text_atts_neg = text_atts[text_neg_idx]
 
-                    probs = valid / (row_sum + 1e-12)
+                text_embeds_all = torch.cat([text_embeds[neg_anchor_idx], text_embeds_neg], dim=0)
+                text_atts_all = torch.cat([text_atts[neg_anchor_idx], text_atts_neg], dim=0)
+                image_embeds_all = torch.cat([image_embeds_neg, image_embeds[neg_anchor_idx]], dim=0)
+                image_atts_all = torch.cat([image_atts_neg, image_atts[neg_anchor_idx]], dim=0)
 
-                    image_neg_idx = torch.multinomial(probs, 1).squeeze(1)  # [B]
-                    text_neg_idx  = torch.multinomial(probs, 1).squeeze(1)  # [B]
-
-
-
-            image_embeds_neg = image_embeds[image_neg_idx]
-            text_embeds_neg = text_embeds[text_neg_idx]
-            text_atts_neg = text_atts[text_neg_idx]
-
-            text_embeds_all = torch.cat([text_embeds, text_embeds_neg], dim=0)
-            text_atts_all = torch.cat([text_atts, text_atts_neg], dim=0)
-            image_embeds_all = torch.cat([image_embeds_neg, image_embeds], dim=0)
-            image_atts_all = torch.cat([image_atts, image_atts], dim=0)
-
-            output_neg_cross = self.text_encoder.bert(
-                encoder_embeds=text_embeds_all,
-                attention_mask=text_atts_all,
-                encoder_hidden_states=image_embeds_all,
-                encoder_attention_mask=image_atts_all,
-                return_dict=True,
-                mode='fusion',
-            )
-
-            vl_embeddings = torch.cat([
-                output_pos.last_hidden_state[:, 0, :],              # [bs, D]
-                output_neg_cross.last_hidden_state[:, 0, :],        # [2*bs, D]
-            ], dim=0)                                              # [3*bs, D]
-            vl_output = self.itm_head(vl_embeddings)               # [3*bs, 2]
+                output_neg_cross = self.text_encoder.bert(
+                    encoder_embeds=text_embeds_all,
+                    attention_mask=text_atts_all,
+                    encoder_hidden_states=image_embeds_all,
+                    encoder_attention_mask=image_atts_all,
+                    return_dict=True,
+                    mode='fusion',
+                )
+                neg_vl_output = self.itm_head(output_neg_cross.last_hidden_state[:, 0, :].float())
+            else:
+                neg_vl_output = pos_vl_output.new_empty((0, pos_vl_output.shape[1]))
+            vl_output = torch.cat([pos_vl_output, neg_vl_output], dim=0)  # [3*bs, 2]
 
             itm_labels = torch.cat([
                 torch.ones(bs, dtype=torch.long),
                 torch.zeros(vl_output.shape[0] - bs, dtype=torch.long)
             ], dim=0).to(image1.device)
 
-            # 纯硬标签 CE
+            ambiguous_pairs = self._sample_ambiguous_pairs(idx.view(-1)) if lambda_amb > 0 else None
+            loss_amb = self._compute_ambiguous_ranking_loss(
+                image_embeds=image_embeds,
+                image_atts=image_atts,
+                text_embeds=text_embeds,
+                text_atts=text_atts,
+                positive_matched_logits=pos_vl_output[:, 1],
+                ambiguous_pairs=ambiguous_pairs,
+                fusion_encoder=self.text_encoder,
+                itm_head=self.itm_head,
+            )
+
+            self.latest_ambiguous_stats.update(
+                {
+                    "active": float(lambda_amb > 0),
+                    "num_pairs": float(0 if ambiguous_pairs is None else ambiguous_pairs.shape[0]),
+                    "loss": float(loss_amb.detach().item()),
+                }
+            )
+
+            # Same pseudo-ID cross pairs are no longer released as hard negatives.
+            # They only receive a lightweight ranking constraint against the original matched pair.
             loss_itm = F.cross_entropy(vl_output, itm_labels)
-            loss_dict['loss_itm'] = loss_itm
+            loss_dict['loss_itm'] = loss_itm + lambda_amb * loss_amb
 
         return loss_dict

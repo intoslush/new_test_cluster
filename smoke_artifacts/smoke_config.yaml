@@ -59,7 +59,4 @@ conf_min_cluster_size: 1
 cluster_k1: 3
 cluster_k2: 2
 
-use_relation_rectification: True
-relation_warmup_epochs: 6
-relation_ratio_threshold: 0.9
-relation_self_threshold: 0.5
+lambda_amb: 0.1
