@@ -157,15 +157,15 @@ def do_train(start_epoch, args, model, train_loader, evaluator, checkpointer, cl
                     loss = loss + weight * v
 
             if n_iter % args.log_period == 0:
-                ambiguous_stats = getattr(model_without_ddp, "latest_ambiguous_stats", None)
-                if ambiguous_stats is not None:
+                pair_release_stats = getattr(model_without_ddp, "latest_pair_release_stats", None)
+                if pair_release_stats is not None:
                     logger.info(
-                        "[Ambiguous][epoch %s batch %s] active=%s pairs=%d loss=%.4f",
+                        "[PairRelease][epoch %s batch %s] active=%s candidates=%d released=%d",
                         epoch,
                         n_iter,
-                        int(ambiguous_stats.get("active", 0.0) > 0),
-                        int(ambiguous_stats.get("num_pairs", 0.0)),
-                        float(ambiguous_stats.get("loss", 0.0)),
+                        int(pair_release_stats.get("active", 0.0) > 0),
+                        int(pair_release_stats.get("num_candidates", 0.0)),
+                        int(pair_release_stats.get("num_released", 0.0)),
                     )
 
             optimizer.zero_grad(set_to_none=True)

@@ -2,11 +2,23 @@
 
 set -euo pipefail
 
-export CUDA_VISIBLE_DEVICES=0
+export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
 
 NUM_GPUS=$(echo "$CUDA_VISIBLE_DEVICES" | tr ',' '\n' | wc -l)
 DATASET_NAME="ICFG-PEDES"
-MASTER_PORT="${MASTER_PORT:-29505}"
+EXP_DESC="${1:-ICFG-PEDES baseline with cross-modal confidence calibration for pseudo supervision}"
+ROOT_LOG="${2:-./output_icfg.log}"
+MASTER_PORT="${MASTER_PORT:-29506}"
+
+mkdir -p "$(dirname "$ROOT_LOG")"
+exec > >(tee -a "$ROOT_LOG") 2>&1
+
+echo "[$(date '+%F %T')] Launching experiment"
+echo "Dataset: ${DATASET_NAME}"
+echo "GPUs: ${CUDA_VISIBLE_DEVICES}"
+echo "Root log: ${ROOT_LOG}"
+echo "Description: ${EXP_DESC}"
+echo "Master port: ${MASTER_PORT}"
 
 CMD=(
   torchrun
@@ -16,11 +28,13 @@ CMD=(
   --master-port="${MASTER_PORT}"
   train.py
   --name new_rasa
+  --config ./configs/PS_icfg_pedes.yaml
   --checkpoint ./data/ALBEF/ALBEF.pth
   --dataset_name "${DATASET_NAME}"
   --root_dir ./re_id
-  --num_epoch 30
-  --config ./configs/PS_icfg_pedes.yaml
+  --num_epoch 35
+  --cluster_id_mode cluster
+  --massage "${EXP_DESC}"
 )
 
 PYTHONUNBUFFERED=1 "${CMD[@]}"

@@ -9,13 +9,17 @@ def get_dataloder(args):
     yaml = YAML.YAML(typ='rt') 
     config = yaml.load(open(args.config, 'r')) 
     train_dataset, val_dataset, test_dataset = create_dataset('ps', config)
+    same_cluster_sampler_instances = max(
+        2,
+        int(config.get('same_cluster_sampler_instances', config.get('relation_sampler_instances', 2))),
+    )
 
     sampler = ValidIndexDistributedSampler(
         train_dataset,
         num_replicas=get_world_size() if args.distributed else 1,
         rank=get_rank() if args.distributed else 0,
         batch_size=config['batch_size_train'],
-        num_instances=max(2, int(config.get('relation_sampler_instances', 2))),
+        num_instances=same_cluster_sampler_instances,
     )
 
     samplers = [sampler, None, None]

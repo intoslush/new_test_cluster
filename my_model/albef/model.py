@@ -83,61 +83,68 @@ class ALBEF(VisionBuilderMixin, MomentumMixin, QueueMixin, MLMMixin, InfMaskMixi
         self.copy_params()
         # Queues
         self._init_queues(embed_dim)
-        self.latest_ambiguous_stats = self._init_ambiguous_stats(active=False)
+        self.latest_pair_release_stats = self._init_pair_release_stats(active=False)
 
-    def _init_ambiguous_stats(self, active: bool) -> Dict[str, float]:
+    def _init_pair_release_stats(self, active: bool) -> Dict[str, float]:
         return {
             "active": float(active),
-            "num_pairs": 0.0,
-            "loss": 0.0,
+            "num_candidates": 0.0,
+            "num_released": 0.0,
         }
 
-    def _sample_ambiguous_pairs(
+    def _sample_low_conf_pair_candidates(
         self,
         pseudo_labels: torch.Tensor,
+        confidence_groups: torch.Tensor,
     ) -> Optional[torch.Tensor]:
         labels = pseudo_labels.view(-1)
-        groups = defaultdict(list)
+        confidence_groups = confidence_groups.view(-1)
+        cluster_members = defaultdict(list)
         for idx, label in enumerate(labels.tolist()):
             if int(label) < 0:
                 continue
-            groups[int(label)].append(idx)
+            cluster_members[int(label)].append(idx)
 
         pairs = []
-        for members in groups.values():
+        for members in cluster_members.values():
             if len(members) < 2:
                 continue
-            order = torch.randperm(len(members), device=labels.device).tolist()
-            shuffled_members = [members[i] for i in order]
-            # Keep the extra ITM cost bounded by sampling disjoint same-cluster pairs.
-            for start in range(0, len(shuffled_members) - 1, 2):
-                pairs.append([shuffled_members[start], shuffled_members[start + 1]])
+
+            # Conservative release only inspects one-to-one low-vs-non-low pairs inside a pseudo-ID cluster.
+            low_members = [member for member in members if int(confidence_groups[member].item()) == 0]
+            non_low_members = [member for member in members if int(confidence_groups[member].item()) > 0]
+            if not low_members or not non_low_members:
+                continue
+
+            low_order = torch.randperm(len(low_members), device=labels.device).tolist()
+            non_low_order = torch.randperm(len(non_low_members), device=labels.device).tolist()
+            paired_count = min(len(low_members), len(non_low_members))
+            for offset in range(paired_count):
+                pairs.append([low_members[low_order[offset]], non_low_members[non_low_order[offset]]])
 
         if not pairs:
             return None
         return torch.tensor(pairs, dtype=torch.long, device=labels.device)
 
-    def _compute_ambiguous_ranking_loss(
+    def _select_releasable_low_conf_pairs(
         self,
         image_embeds: torch.Tensor,
         image_atts: torch.Tensor,
         text_embeds: torch.Tensor,
         text_atts: torch.Tensor,
-        positive_matched_logits: torch.Tensor,
-        ambiguous_pairs: Optional[torch.Tensor],
+        positive_match_scores: torch.Tensor,
+        candidate_pairs: Optional[torch.Tensor],
         fusion_encoder,
         itm_head,
-    ) -> torch.Tensor:
-        if ambiguous_pairs is None or ambiguous_pairs.numel() == 0:
-            return positive_matched_logits.new_zeros(())
+    ) -> Optional[torch.Tensor]:
+        if candidate_pairs is None or candidate_pairs.numel() == 0:
+            return None
 
-        a_idx = ambiguous_pairs[:, 0]
-        b_idx = ambiguous_pairs[:, 1]
+        a_idx = candidate_pairs[:, 0]
+        b_idx = candidate_pairs[:, 1]
         image_idx = torch.cat([a_idx, b_idx], dim=0)
         text_idx = torch.cat([b_idx, a_idx], dim=0)
 
-        # Same pseudo-ID cross pairs stay outside the hard-negative pool.
-        # We only ask the original matched pair to score higher than one in-cluster cross pair.
         output = fusion_encoder.bert(
             encoder_embeds=text_embeds[text_idx],
             attention_mask=text_atts[text_idx],
@@ -147,16 +154,18 @@ class ALBEF(VisionBuilderMixin, MomentumMixin, QueueMixin, MLMMixin, InfMaskMixi
             mode='fusion',
             output_hidden_states=False,
         )
-        matched_logits = itm_head(output.last_hidden_state[:, 0, :].float())[:, 1]
+        matched_probs = F.softmax(itm_head(output.last_hidden_state[:, 0, :].float()), dim=-1)[:, 1]
 
-        num_pairs = ambiguous_pairs.shape[0]
-        z_ij = matched_logits[:num_pairs]
-        z_ji = matched_logits[num_pairs:]
-        z_ii = positive_matched_logits[a_idx]
-        z_jj = positive_matched_logits[b_idx]
-
-        loss = 0.5 * (F.softplus(z_ij - z_ii) + F.softplus(z_ji - z_jj))
-        return loss.mean()
+        num_pairs = candidate_pairs.shape[0]
+        s_ij = matched_probs[:num_pairs]
+        s_ji = matched_probs[num_pairs:]
+        # Release only when both cross-pair scores stay below both original matched scores.
+        self_min = torch.minimum(positive_match_scores[a_idx], positive_match_scores[b_idx])
+        cross_max = torch.maximum(s_ij, s_ji)
+        release_mask = cross_max < self_min
+        if not torch.any(release_mask):
+            return None
+        return candidate_pairs[release_mask]
 
     def forward(self, batch, alpha, config, epoch):  # text2 是概率同一个 id 的其他图片描述, img1/img2 同一图不同增广
         loss_dict = {}
@@ -168,11 +177,16 @@ class ALBEF(VisionBuilderMixin, MomentumMixin, QueueMixin, MLMMixin, InfMaskMixi
         text_atts = text2['attention_mask']
         idx = batch['person_id']
         idx = batch['pseudo_label']  # 覆盖为伪标签，保持原逻辑
-        lambda_amb = float(config.get("lambda_amb", 0.1))
-        self.latest_ambiguous_stats = self._init_ambiguous_stats(active=False)
+        enable_low_conf_pair_release = bool(config.get("enable_low_conf_pair_release", True))
+        pair_release_warmup_epochs = int(config.get("pair_release_warmup_epochs", 6))
+        pair_release_active = enable_low_conf_pair_release and int(epoch) >= pair_release_warmup_epochs
+        self.latest_pair_release_stats = self._init_pair_release_stats(active=pair_release_active)
         confidence = batch.get('confidence')
         if confidence is not None:
             confidence = confidence.to(image1.device, dtype=torch.float32).view(-1)
+        confidence_group = batch.get('confidence_group')
+        if confidence_group is not None:
+            confidence_group = confidence_group.to(image1.device, dtype=torch.long).view(-1)
 
         # extract image features
         image_embeds = self.visual_encoder(image1,register_blk=-1)
@@ -356,8 +370,40 @@ class ALBEF(VisionBuilderMixin, MomentumMixin, QueueMixin, MLMMixin, InfMaskMixi
                     raise ValueError(f"config['itm_neg_sampling'] must be 'cl' or 'random', got {itm_neg_sampling}")
 
                 idx_1d = idx.view(-1)  # [B]
-                # Same pseudo-ID cross pairs are handled by the ranking loss, not by hard-negative ITM labels.
                 mask_exclude = torch.eq(idx_1d.view(bs, 1), idx_1d.view(1, bs))  # [B,B]
+                candidate_pairs = None
+                released_pairs = None
+                if pair_release_active and confidence_group is not None and confidence_group.shape[0] == bs:
+                    candidate_pairs = self._sample_low_conf_pair_candidates(
+                        pseudo_labels=idx_1d,
+                        confidence_groups=confidence_group,
+                    )
+                    released_pairs = self._select_releasable_low_conf_pairs(
+                        image_embeds=image_embeds,
+                        image_atts=image_atts,
+                        text_embeds=text_embeds,
+                        text_atts=text_atts,
+                        positive_match_scores=F.softmax(pos_vl_output.detach(), dim=-1)[:, 1],
+                        candidate_pairs=candidate_pairs,
+                        fusion_encoder=self.text_encoder,
+                        itm_head=self.itm_head,
+                    )
+                    if released_pairs is not None and released_pairs.numel() > 0:
+                        release_a = released_pairs[:, 0]
+                        release_b = released_pairs[:, 1]
+                        mask_exclude[release_a, release_b] = False
+                        mask_exclude[release_b, release_a] = False
+
+                self.latest_pair_release_stats.update(
+                    {
+                        "active": float(pair_release_active),
+                        "num_candidates": float(0 if candidate_pairs is None else candidate_pairs.shape[0]),
+                        "num_released": float(0 if released_pairs is None else released_pairs.shape[0]),
+                    }
+                )
+
+                # Same pseudo-ID pairs stay masked by default.
+                # Only low-confidence one-to-one candidates that pass the strict bottom-two ITM check are released.
                 neg_anchor_idx = (~mask_exclude).any(dim=1).nonzero(as_tuple=False).view(-1)
 
                 if itm_neg_sampling == "cl":
@@ -424,29 +470,7 @@ class ALBEF(VisionBuilderMixin, MomentumMixin, QueueMixin, MLMMixin, InfMaskMixi
                 torch.zeros(vl_output.shape[0] - bs, dtype=torch.long)
             ], dim=0).to(image1.device)
 
-            ambiguous_pairs = self._sample_ambiguous_pairs(idx.view(-1)) if lambda_amb > 0 else None
-            loss_amb = self._compute_ambiguous_ranking_loss(
-                image_embeds=image_embeds,
-                image_atts=image_atts,
-                text_embeds=text_embeds,
-                text_atts=text_atts,
-                positive_matched_logits=pos_vl_output[:, 1],
-                ambiguous_pairs=ambiguous_pairs,
-                fusion_encoder=self.text_encoder,
-                itm_head=self.itm_head,
-            )
-
-            self.latest_ambiguous_stats.update(
-                {
-                    "active": float(lambda_amb > 0),
-                    "num_pairs": float(0 if ambiguous_pairs is None else ambiguous_pairs.shape[0]),
-                    "loss": float(loss_amb.detach().item()),
-                }
-            )
-
-            # Same pseudo-ID cross pairs are no longer released as hard negatives.
-            # They only receive a lightweight ranking constraint against the original matched pair.
             loss_itm = F.cross_entropy(vl_output, itm_labels)
-            loss_dict['loss_itm'] = loss_itm + lambda_amb * loss_amb
+            loss_dict['loss_itm'] = loss_itm
 
         return loss_dict

@@ -80,5 +80,6 @@ conf_debug_log: True
 conf_chunk_size: 4096
 conf_min_cluster_size: 1
 
-lambda_amb: 0.1
+enable_low_conf_pair_release: True
+pair_release_warmup_epochs: 6
 enable_itm_loss: True

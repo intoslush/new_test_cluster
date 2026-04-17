@@ -59,4 +59,5 @@ conf_min_cluster_size: 1
 cluster_k1: 3
 cluster_k2: 2
 
-lambda_amb: 0.1
+enable_low_conf_pair_release: True
+pair_release_warmup_epochs: 6

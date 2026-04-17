@@ -15,7 +15,6 @@ batch_size_test: 64
 mlm_probability: 0.15
 weak_pos_pair_probability: 0.1
 mrtd_mask_probability: 0.3
-
 queue_size: 65536
 momentum: 0.995
 vision_width: 768
@@ -29,45 +28,50 @@ warm_up: True
 optimizer: {opt: adamW, lr: 1e-5, weight_decay: 0.02, lr_custm: 1e-4}
 schedular: {sched: cosine, lr: 1e-5, epochs: 35, min_lr: 2e-6, decay_rate: 1, warmup_lr: 1e-5, warmup_epochs: 1, cooldown_epochs: 0}
 
-eval_epoch: 10
+eval_epoch: 0
 
 
-weights: {"loss_cl": 0.5, "loss_itm": 1, "loss_mlm": 1, "loss_prd": 0.5, "loss_mrtd": 0.5,"loss_sim": 0.5}
-# 新增的权重调度配置
+weights: {"loss_cl": 0.5, "loss_itm": 1, "loss_mlm": 1}
 weights_schedule:
-  freeze_epochs: 40     # 前 20 个 epoch 不变
-  mode: "cosine"        # 可改为 "cosine" 获得更平滑的变化linear
-  normalize_sum: false  # 若希望总权重和保持不变可改为 true
+  freeze_epochs: 40
+  mode: "cosine"
+  normalize_sum: false
   loss_cl:
-    min: 0            # 20 之后从 0.5 线性降到 0.1（到最后一个 epoch 达到）
+    min: 0
   loss_mlm:
-    max: 1.5 
+    max: 1.5
   loss_itm:
-    min: 0.2 
+    min: 0.2
     max: 1.5
 
-use_momentum_queue: True #是否使用动量
-use_queue: True #是否使用队列
-reset_queue_each_epoch: False  #每个epoch是否重置队列
+use_momentum: True
+use_queue: True
+reset_queue_each_epoch: True
 enable_cl_loss: True
-itm_neg_sampling  : 'cl' # 一个参数决定采样方式：'cl' or 'random'，如果关cl需要改为random
+itm_neg_sampling: 'cl'
 
-enable_mlm_loss:  True
+enable_mlm_loss: True
 mlm_soft_label: False
 
-use_conf_calibration: False
+cluster_feature_mode: "image"
+cluster_fusion_use_proj: False
+cluster_min_samples: 5
+cluster_eps: 0.6
+
+use_conf_calibration: True
 conf_alpha: 1.0
 conf_beta: 1.0
 conf_temp: 1.0
-conf_noise_value: 0.0
+conf_noise_value: 0.05
 conf_high_thres: 0.7
 conf_low_thres: 0.3
 conf_weight_id_loss: True
-conf_weight_metric_loss: False
+conf_weight_metric_loss: True
 conf_use_text_prototype: True
-conf_debug_log: False
+conf_debug_log: True
 conf_chunk_size: 4096
 conf_min_cluster_size: 1
 
-lambda_amb: 0.1
+enable_low_conf_pair_release: True
+pair_release_warmup_epochs: 6
 enable_itm_loss: True
