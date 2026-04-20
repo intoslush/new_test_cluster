@@ -21,7 +21,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 from my_model.xbert import BertConfig, BertForMaskedLM
-from utils.confidence import get_conf_calibration_cfg, normalize_weighted_mean
+from utils.confidence import get_conf_calibration_cfg
 from .mixins import (
     VisionBuilderMixin,
     MomentumMixin,
@@ -182,7 +182,9 @@ class ALBEF(VisionBuilderMixin, MomentumMixin, QueueMixin, MLMMixin, InfMaskMixi
         pair_release_active = enable_low_conf_pair_release and int(epoch) >= pair_release_warmup_epochs
         self.latest_pair_release_stats = self._init_pair_release_stats(active=pair_release_active)
         confidence = batch.get('confidence')
-        if confidence is not None:
+        if confidence is None:
+            confidence = torch.ones(image1.size(0), device=image1.device, dtype=torch.float32)
+        else:
             confidence = confidence.to(image1.device, dtype=torch.float32).view(-1)
         confidence_group = batch.get('confidence_group')
         if confidence_group is not None:
@@ -209,11 +211,18 @@ class ALBEF(VisionBuilderMixin, MomentumMixin, QueueMixin, MLMMixin, InfMaskMixi
             # -------- 1) 构造对比的候选集合：batch-only 或 batch+queue --------
             if use_queue:
                 idx_all = torch.cat([idx.t(), self.idx_queue.clone().detach()], dim=1)  # [1, B+Q]
+                confidence_all = torch.cat(
+                    [confidence.view(1, -1), self.confidence_queue.clone().detach()],
+                    dim=1,
+                )  # [1, B+Q]
             else:
                 idx_all = idx.t()  # [1, B]
+                confidence_all = confidence.view(1, -1)  # [1, B]
 
             pos_idx = torch.eq(idx, idx_all).float()  # [B, B(+Q)]
-            sim_targets = pos_idx / (pos_idx.sum(1, keepdim=True) + 1e-8)
+            # Pair-aware pseudo-positive target: positives are reweighted by target-side reliability w_j.
+            sim_targets = pos_idx * confidence_all.to(dtype=pos_idx.dtype)
+            sim_targets = sim_targets / (sim_targets.sum(1, keepdim=True) + 1e-8)
 
             # -------- 2) 计算 soft targets（可选动量） --------
             sim_i2t_targets = sim_targets
@@ -283,25 +292,16 @@ class ALBEF(VisionBuilderMixin, MomentumMixin, QueueMixin, MLMMixin, InfMaskMixi
 
             loss_i2t_per = -torch.sum(F.log_softmax(sim_i2t, dim=1) * sim_i2t_targets, dim=1)
             loss_t2i_per = -torch.sum(F.log_softmax(sim_t2i, dim=1) * sim_t2i_targets, dim=1)
-            if (
-                bool(conf_cfg["enabled"])
-                and bool(conf_cfg["weight_metric_loss"])
-                and confidence is not None
-                and confidence.shape[0] == loss_i2t_per.shape[0]
-            ):
-                loss_i2t = normalize_weighted_mean(loss_i2t_per, confidence, eps=float(conf_cfg["eps"]))
-                loss_t2i = normalize_weighted_mean(loss_t2i_per, confidence, eps=float(conf_cfg["eps"]))
-            else:
-                loss_i2t = loss_i2t_per.mean()
-                loss_t2i = loss_t2i_per.mean()
+            loss_i2t = loss_i2t_per.mean()
+            loss_t2i = loss_t2i_per.mean()
             loss_dict['loss_cl'] = (loss_i2t + loss_t2i) / 2
 
             # -------- 4) 队列更新：只有 use_queue=True 才更新 --------
             if use_queue:
                 if use_momentum:
-                    self._dequeue_and_enqueue(image_feat_m, text_feat_m, idx)
+                    self._dequeue_and_enqueue(image_feat_m, text_feat_m, idx, confidence)
                 else:
-                    self._dequeue_and_enqueue(image_feat.detach(), text_feat.detach(), idx)
+                    self._dequeue_and_enqueue(image_feat.detach(), text_feat.detach(), idx, confidence)
 
         # ===== Masked Language Modeling =====
         enable_mlm_loss = bool(config.get('enable_mlm_loss', False))
