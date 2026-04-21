@@ -220,9 +220,19 @@ class ALBEF(VisionBuilderMixin, MomentumMixin, QueueMixin, MLMMixin, InfMaskMixi
                 confidence_all = confidence.view(1, -1)  # [1, B]
 
             pos_idx = torch.eq(idx, idx_all).float()  # [B, B(+Q)]
-            # Pair-aware pseudo-positive target: positives are reweighted by target-side reliability w_j.
-            sim_targets = pos_idx * confidence_all.to(dtype=pos_idx.dtype)
-            sim_targets = sim_targets / (sim_targets.sum(1, keepdim=True) + 1e-8)
+            # Symmetric pair-aware weighting: w_ij = 1[y_i = y_j] * min(w_i, w_j).
+            pair_confidence = torch.minimum(
+                confidence.view(-1, 1).to(dtype=pos_idx.dtype),
+                confidence_all.to(dtype=pos_idx.dtype),
+            )
+            sim_targets = pos_idx * pair_confidence
+            sim_targets_sum = sim_targets.sum(1, keepdim=True)
+            fallback_targets = pos_idx / (pos_idx.sum(1, keepdim=True) + 1e-8)
+            sim_targets = torch.where(
+                sim_targets_sum > 0,
+                sim_targets / (sim_targets_sum + 1e-8),
+                fallback_targets,
+            )
 
             # -------- 2) 计算 soft targets（可选动量） --------
             sim_i2t_targets = sim_targets
