@@ -80,38 +80,37 @@ def do_train(start_epoch, args, model, train_loader, evaluator, checkpointer, cl
                 logger.info("config (repr):\n%s", pprint.pformat(config, width=120))
             logger.info("========== [End dump] ==========")
 
-        if epoch < 5 or epoch % 2 == 1:
-            pseudo_cache = generate_and_broadcast_pseudo_labels(
-                epoch=epoch,
-                device=device,
-                is_main=is_main,
-                is_distributed=is_distributed,
-                rank=rank,
-                cluster_loader=cluster_loader,
-                model=model,
-                args=args,
-                config=config,
-                logger=logger,
-                enable_nmi_ari=True,
-                cluster_until_epoch=50,
-            )
-            train_loader.dataset.mode = "train"
-            train_loader.dataset.set_pseudo_labels(pseudo_cache["pseudo_labels"].cpu())
-            train_loader.dataset.set_sample_confidences(
-                pseudo_cache["sample_confidence"].cpu(),
-                pseudo_cache["confidence_group"].cpu(),
-            )
+        pseudo_cache = generate_and_broadcast_pseudo_labels(
+            epoch=epoch,
+            device=device,
+            is_main=is_main,
+            is_distributed=is_distributed,
+            rank=rank,
+            cluster_loader=cluster_loader,
+            model=model,
+            args=args,
+            config=config,
+            logger=logger,
+            enable_nmi_ari=True,
+            cluster_until_epoch=num_epoch + 1,
+        )
+        train_loader.dataset.mode = "train"
+        train_loader.dataset.set_pseudo_labels(pseudo_cache["pseudo_labels"].cpu())
+        train_loader.dataset.set_sample_confidences(
+            pseudo_cache["sample_confidence"].cpu(),
+            pseudo_cache["confidence_group"].cpu(),
+        )
 
-            if bool(config.get("reset_queue_each_epoch", True)):
-                synchronize()
-                model.reset_queues(random_init=bool(config.get("queue_random_reinit", False)))
-                if is_main:
-                    logger.info(
-                        "[Rank %s] Reset contrast queue (random_init=%s)",
-                        rank,
-                        bool(config.get("queue_random_reinit", False)),
-                    )
-                synchronize()
+        if bool(config.get("reset_queue_each_epoch", True)):
+            synchronize()
+            model.reset_queues(random_init=bool(config.get("queue_random_reinit", False)))
+            if is_main:
+                logger.info(
+                    "[Rank %s] Reset contrast queue (random_init=%s)",
+                    rank,
+                    bool(config.get("queue_random_reinit", False)),
+                )
+            synchronize()
 
         if hasattr(train_loader, "sampler") and hasattr(train_loader.sampler, "set_valid_indices"):
             train_loader.sampler.set_valid_indices(train_loader.dataset.valid_indices)

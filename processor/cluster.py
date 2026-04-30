@@ -27,31 +27,8 @@ def _infer_cluster_feat_dim(model_no_ddp, config, mode: str) -> int:
 
 
 @torch.no_grad()
-def extract_cluster_features(batch, model_no_ddp, tokenizer, config, device: torch.device) -> torch.Tensor:
-    """
-    返回 [B, D] 的 L2-normalized 特征，用于后续 jaccard + DBSCAN。
-    由 config['cluster_feature_mode'] 控制:
-      - 'image' : vision_proj(image_cls)
-      - 'text'  : text_cls (可选 text_proj)
-      - 'fusion': fusion_cls (可选 text_proj)
-    """
-    mode = str(config.get("cluster_feature_mode", "image")).lower()
-
-    # ---------------- image-only ----------------
-    if mode == "image":
-        image = batch["image1"].to(device, non_blocking=True)
-        image_embeds = model_no_ddp.visual_encoder(image)
-        feat = model_no_ddp.vision_proj(image_embeds[:, 0, :])
-        return F.normalize(feat, dim=-1)
-
-    # text / fusion 需要 tokenizer
-    if tokenizer is None:
-        raise ValueError("tokenizer is required when cluster_feature_mode is 'text' or 'fusion'.")
-
-    # 选用哪个 caption 做聚类（默认 caption2；你也可以切 caption1）
-    text_key = str(config.get("cluster_text_key", "caption2"))
-    texts = batch[text_key]
-    text = tokenizer(
+def _tokenize_texts(texts, tokenizer, config, device: torch.device):
+    return tokenizer(
         texts,
         padding="longest",
         max_length=int(config["max_words"]),
@@ -59,84 +36,107 @@ def extract_cluster_features(batch, model_no_ddp, tokenizer, config, device: tor
         truncation=True,
     ).to(device)
 
-    # ---------------- text-only ----------------
-    if mode == "text":
-        out = model_no_ddp.text_encoder.bert(
-            text["input_ids"],
-            attention_mask=text["attention_mask"],
-            return_dict=True,
-            mode="text",
-        )
-        cls = out.last_hidden_state[:, 0, :]  # [B, text_width]
 
-        if bool(config.get("cluster_text_use_proj", False)):
-            cls = model_no_ddp.text_proj(cls)  # -> [B, embed_dim]
-        return F.normalize(cls, dim=-1)
-
-    # ---------------- fusion CLS ----------------
-    if mode == "fusion":
-        image = batch["image1"].to(device, non_blocking=True)
-        image_embeds = model_no_ddp.visual_encoder(image)
-        image_atts = torch.ones(image_embeds.size()[:-1], dtype=torch.long, device=device)
-
-        # 先跑一遍 text mode 得到 encoder_embeds（保持和你 forward 一致）
-        text_out = model_no_ddp.text_encoder.bert(
-            text["input_ids"],
-            attention_mask=text["attention_mask"],
-            return_dict=True,
-            mode="text",
-        )
-        text_embeds = text_out.last_hidden_state  # [B, L, text_width]
-
-        fusion_out = model_no_ddp.text_encoder.bert(
-            encoder_embeds=text_embeds,
-            attention_mask=text["attention_mask"],
-            encoder_hidden_states=image_embeds,
-            encoder_attention_mask=image_atts,
-            return_dict=True,
-            mode="fusion",
-        )
-        cls = fusion_out.last_hidden_state[:, 0, :]  # [B, text_width]  <-- 你要的“融合层最后一层 CLS”
-
-        if bool(config.get("cluster_fusion_use_proj", False)):
-            cls = model_no_ddp.text_proj(cls)  # -> [B, embed_dim]
-        return F.normalize(cls, dim=-1)
-
-    raise ValueError(f"Unknown cluster_feature_mode: {mode}")
+@torch.no_grad()
+def _encode_text_hidden(model_no_ddp, text_inputs):
+    return model_no_ddp.text_encoder.bert(
+        text_inputs["input_ids"],
+        attention_mask=text_inputs["attention_mask"],
+        return_dict=True,
+        mode="text",
+    )
 
 
 @torch.no_grad()
-def extract_visual_text_features(
+def extract_cluster_feature_bundle(
     batch,
     model_no_ddp,
     tokenizer,
     config,
     device: torch.device,
-    text_key: str = "caption2",
+    *,
+    need_modes,
+    confidence_text_key=None,
 ):
-    if tokenizer is None:
-        raise ValueError("tokenizer is required for confidence calibration feature extraction.")
+    """
+    一次 batch 前向同时提取多路聚类特征，避免 image / text 监控重复跑编码器。
+    返回:
+      {
+        "cluster_features": {"image": ..., "text": ..., "fusion": ...},
+        "confidence_features": {"visual_features": ..., "text_features": ...} | None,
+      }
+    """
+    normalized_modes = {str(mode).lower() for mode in need_modes}
+    need_text_branch = bool({"text", "fusion"} & normalized_modes)
+    if tokenizer is None and (need_text_branch or confidence_text_key is not None):
+        raise ValueError("tokenizer is required for text/fusion clustering or confidence calibration.")
 
-    image = batch["image1"].to(device, non_blocking=True)
-    image_embeds = model_no_ddp.visual_encoder(image)
-    visual_feat = F.normalize(model_no_ddp.vision_proj(image_embeds[:, 0, :]), dim=-1)
+    cluster_features = {}
+    cluster_text_key = str(config.get("cluster_text_key", "caption2"))
 
-    texts = batch[text_key]
-    text = tokenizer(
-        texts,
-        padding="longest",
-        max_length=int(config["max_words"]),
-        return_tensors="pt",
-        truncation=True,
-    ).to(device)
-    text_out = model_no_ddp.text_encoder.bert(
-        text["input_ids"],
-        attention_mask=text["attention_mask"],
-        return_dict=True,
-        mode="text",
-    )
-    text_feat = F.normalize(model_no_ddp.text_proj(text_out.last_hidden_state[:, 0, :]), dim=-1)
-    return visual_feat, text_feat
+    need_image_branch = ("image" in normalized_modes) or ("fusion" in normalized_modes) or (confidence_text_key is not None)
+    image_embeds = None
+    image_proj = None
+    if need_image_branch:
+        image = batch["image1"].to(device, non_blocking=True)
+        image_embeds = model_no_ddp.visual_encoder(image)
+        if ("image" in normalized_modes) or (confidence_text_key is not None):
+            image_proj = F.normalize(model_no_ddp.vision_proj(image_embeds[:, 0, :]), dim=-1)
+        if "image" in normalized_modes:
+            cluster_features["image"] = image_proj
+
+    cluster_text_inputs = None
+    cluster_text_out = None
+    cluster_text_cls = None
+    if need_text_branch:
+        cluster_text_inputs = _tokenize_texts(batch[cluster_text_key], tokenizer, config, device)
+        cluster_text_out = _encode_text_hidden(model_no_ddp, cluster_text_inputs)
+        cluster_text_cls = cluster_text_out.last_hidden_state[:, 0, :]
+
+        if "text" in normalized_modes:
+            text_feat = cluster_text_cls
+            if bool(config.get("cluster_text_use_proj", False)):
+                text_feat = model_no_ddp.text_proj(text_feat)
+            cluster_features["text"] = F.normalize(text_feat, dim=-1)
+
+        if "fusion" in normalized_modes:
+            if image_embeds is None:
+                raise ValueError("image features are required when cluster_feature_mode='fusion'.")
+            image_atts = torch.ones(image_embeds.size()[:-1], dtype=torch.long, device=device)
+            fusion_out = model_no_ddp.text_encoder.bert(
+                encoder_embeds=cluster_text_out.last_hidden_state,
+                attention_mask=cluster_text_inputs["attention_mask"],
+                encoder_hidden_states=image_embeds,
+                encoder_attention_mask=image_atts,
+                return_dict=True,
+                mode="fusion",
+            )
+            fusion_cls = fusion_out.last_hidden_state[:, 0, :]
+            if bool(config.get("cluster_fusion_use_proj", False)):
+                fusion_cls = model_no_ddp.text_proj(fusion_cls)
+            cluster_features["fusion"] = F.normalize(fusion_cls, dim=-1)
+
+    confidence_features = None
+    if confidence_text_key is not None:
+        if image_proj is None:
+            raise ValueError("confidence calibration requires visual projection features.")
+
+        if confidence_text_key == cluster_text_key and cluster_text_cls is not None:
+            confidence_text_cls = cluster_text_cls
+        else:
+            confidence_text_inputs = _tokenize_texts(batch[confidence_text_key], tokenizer, config, device)
+            confidence_text_out = _encode_text_hidden(model_no_ddp, confidence_text_inputs)
+            confidence_text_cls = confidence_text_out.last_hidden_state[:, 0, :]
+
+        confidence_features = {
+            "visual_features": image_proj,
+            "text_features": F.normalize(model_no_ddp.text_proj(confidence_text_cls), dim=-1),
+        }
+
+    return {
+        "cluster_features": cluster_features,
+        "confidence_features": confidence_features,
+    }
 
 
 def compute_jaccard_to_memmap(
@@ -290,6 +290,62 @@ def dbscan_memmap(jaccard_path: str, eps: float = 0.6, min_samples: int = 4):
     return labels  # numpy array
 
 
+def _cluster_single_mode(
+    features: torch.Tensor,
+    *,
+    mode: str,
+    config,
+    args,
+    logger,
+):
+    save_path = f"./logs/pseudo_labels_{mode}.pt"
+    jaccard_path = f"./tmp/{mode}_rerank_jaccard.memmap"
+
+    if args.distributed:
+        search_option = 2
+        logger.info("[Cluster][%s] Rank %s | 开始计算距离", mode, torch.distributed.get_rank())
+    else:
+        search_option = 3
+        logger.info("[Cluster][%s] 单卡 | 开始计算距离", mode)
+
+    compute_jaccard_to_memmap(
+        features,
+        out_path=jaccard_path,
+        k1=int(config.get("cluster_k1", 30)),
+        k2=int(config.get("cluster_k2", 6)),
+        use_float16=True,
+        row_chunk=int(config.get("cluster_row_chunk", 1024)),
+        search_option=search_option,
+    )
+
+    logger.info("[Cluster][%s] 开始基于 memmap 的 DBSCAN 聚类", mode)
+    pseudo_labels = dbscan_memmap(
+        jaccard_path,
+        eps=float(config.get("cluster_eps", 0.6)),
+        min_samples=int(config.get("cluster_min_samples", 4)),
+    )
+    if not os.path.exists(save_path):
+        torch.save(pseudo_labels, save_path)
+        logger.info("[Cluster][%s] 首轮伪标签快照已保存至 %s", mode, save_path)
+
+    num_noise = int((pseudo_labels == -1).sum())
+    unique_labels = set(pseudo_labels.tolist())
+    num_clusters = len(unique_labels) - (1 if -1 in unique_labels else 0)
+    logger.info(
+        "[Cluster][%s] 聚类完成 | total=%d, clusters=%d, noise=%d",
+        mode,
+        len(pseudo_labels),
+        num_clusters,
+        num_noise,
+    )
+
+    return {
+        "pseudo_labels": pseudo_labels,
+        "num_clusters": num_clusters,
+        "num_noise": num_noise,
+    }
+
+
 @torch.no_grad()
 def cluster_begin_epoch(train_loader, model, args, config, tokenizer=None, logger=None):
     device = torch.device("cuda")
@@ -302,9 +358,20 @@ def cluster_begin_epoch(train_loader, model, args, config, tokenizer=None, logge
         model_no_ddp = model
 
     max_size = len(train_loader.dataset)
-    feat_dim = _infer_cluster_feat_dim(model_no_ddp, config, mode=str(config.get("cluster_feature_mode", "image")))
-    # bank 放 GPU，float16 足够
-    feat_bank = torch.empty((max_size, feat_dim), device=device, dtype=torch.float16)
+    train_mode = str(config.get("cluster_feature_mode", "image")).lower()
+    modes_to_cluster = []
+    for mode in ("image", "text", train_mode):
+        if mode not in modes_to_cluster:
+            modes_to_cluster.append(mode)
+
+    feature_banks = {
+        mode: torch.empty(
+            (max_size, _infer_cluster_feat_dim(model_no_ddp, config, mode=mode)),
+            device=device,
+            dtype=torch.float16,
+        )
+        for mode in modes_to_cluster
+    }
     conf_cfg = get_conf_calibration_cfg(config)
     need_confidence_cache = bool(conf_cfg["enabled"])
     visual_bank = None
@@ -315,58 +382,40 @@ def cluster_begin_epoch(train_loader, model, args, config, tokenizer=None, logge
         text_bank = torch.empty((max_size, embed_dim), device=device, dtype=torch.float16)
 
     index = 0
-
-    # 输出路径按模式区分，避免互相覆盖
-    mode = str(config.get("cluster_feature_mode", "image")).lower()
-    save_path = f"./logs/pseudo_labels_{mode}.pt"
-    save_feats = f"./logs/feats_{mode}.pt"
-    jaccard_path = f"./tmp/{mode}_rerank_jaccard.memmap"
     os.makedirs("./logs", exist_ok=True)
     os.makedirs("./tmp", exist_ok=True)
 
-    test = False  # 保留你的缓存开关
+    logger.info(
+        "开始计算伪标签 | train_cluster_feature_mode=%s | monitor_modes=%s",
+        train_mode,
+        ",".join([mode for mode in ("image", "text") if mode in modes_to_cluster]),
+    )
 
-    logger.info(f"开始计算伪标签 | cluster_feature_mode={mode} | feat_dim={feat_dim}")
-
-    # 1) load cached features if exist
-    if test and os.path.exists(save_feats):
-        bank_cpu = torch.load(save_feats, weights_only=False)
-        feat_bank = bank_cpu.to(device=device, dtype=torch.float16)
-        index = feat_bank.size(0)
-        logger.info(f"检测到已保存的特征，加载 {save_feats}")
-    else:
-        for i, batch in enumerate(train_loader):
-            # 关键：按模式抽取 [B, D] 特征
-            feats = extract_cluster_features(batch, model_no_ddp, model_no_ddp.tokenizer, config, device)  # float32/16
-            feats = feats.to(torch.float16)
-
-            bs = feats.size(0)
-            feat_bank[index:index + bs] = feats
-            if need_confidence_cache:
-                visual_feats, text_feats = extract_visual_text_features(
-                    batch,
-                    model_no_ddp,
-                    model_no_ddp.tokenizer,
-                    config,
-                    device,
-                    text_key=str(conf_cfg["text_key"]),
-                )
-                visual_bank[index:index + bs] = visual_feats.to(torch.float16)
-                text_bank[index:index + bs] = text_feats.to(torch.float16)
-            index += bs
-
-        # 可选保存（仅 rank0）
-        if test and (not args.distributed or (args.distributed and torch.distributed.get_rank() == 0)):
-            torch.save(feat_bank[:index].cpu(), save_feats)
-            logger.info(f"特征已保存至 {save_feats}")
+    for _, batch in enumerate(train_loader):
+        feature_bundle = extract_cluster_feature_bundle(
+            batch,
+            model_no_ddp,
+            model_no_ddp.tokenizer,
+            config,
+            device,
+            need_modes=modes_to_cluster,
+            confidence_text_key=str(conf_cfg["text_key"]) if need_confidence_cache else None,
+        )
+        cluster_features = feature_bundle["cluster_features"]
+        bs = batch["image1"].size(0)
+        for mode in modes_to_cluster:
+            feature_banks[mode][index:index + bs] = cluster_features[mode].to(torch.float16)
+        if need_confidence_cache:
+            confidence_features = feature_bundle["confidence_features"]
+            visual_bank[index:index + bs] = confidence_features["visual_features"].to(torch.float16)
+            text_bank[index:index + bs] = confidence_features["text_features"].to(torch.float16)
+        index += bs
 
     if index != max_size:
         # 重要：如果你在 DDP 下用 DistributedSampler，这里通常会触发（每张卡只看一部分数据）
         logger.warning(f"注意：feature bank 填充长度 index={index} != dataset_len={max_size}。"
                        f"如果你在分布式聚类，请确保用全量数据/或先 gather 特征。")
 
-    # 2) 计算 jaccard 并写 memmap（只用已经填充的部分）
-    feat_bank_used = feat_bank[:index].to(torch.float32)
     confidence_feature_cache = None
     if need_confidence_cache:
         confidence_feature_cache = {
@@ -375,64 +424,35 @@ def cluster_begin_epoch(train_loader, model, args, config, tokenizer=None, logge
         }
         del visual_bank, text_bank
 
-    if args.distributed:
-        search_option = 2
-        logger.info(f"Rank {torch.distributed.get_rank()} | 开始计算距离")
-    else:
-        search_option = 3
-        logger.info("单卡 | 开始计算距离")
+    cluster_outputs = {}
+    for mode in modes_to_cluster:
+        feat_bank_used = feature_banks[mode][:index].to(torch.float32)
+        cluster_outputs[mode] = _cluster_single_mode(
+            feat_bank_used,
+            mode=mode,
+            config=config,
+            args=args,
+            logger=logger,
+        )
+        del feature_banks[mode], feat_bank_used
+        torch.cuda.empty_cache()
+        gc.collect()
 
-    compute_jaccard_to_memmap(
-        feat_bank_used,
-        out_path=jaccard_path,
-        k1=int(config.get("cluster_k1", 30)),
-        k2=int(config.get("cluster_k2", 6)),
-        use_float16=True,
-        row_chunk=int(config.get("cluster_row_chunk", 1024)),
-        search_option=search_option
+    train_cluster_output = cluster_outputs[train_mode]
+    logger.info(
+        "Dataset 总长度: %d, 训练伪标签长度: %d, train_cluster_feature_mode=%s\n",
+        len(train_loader.dataset),
+        len(train_cluster_output["pseudo_labels"]),
+        train_mode,
     )
 
-    # 释放 GPU bank
-    del feat_bank, feat_bank_used
-    torch.cuda.empty_cache()
-    gc.collect()
-
-    # 3) DBSCAN on memmap
-    logger.info("开始基于 memmap 的 DBSCAN 聚类")
-    if args.distributed:
-        rank = torch.distributed.get_rank()
-    else:
-        rank = 0
-
-    image_pseudo_labels = None
-    if (not args.distributed) or (args.distributed and rank == 0):
-        image_pseudo_labels = dbscan_memmap(
-            jaccard_path,
-            eps=float(config.get("cluster_eps", 0.6)),
-            min_samples=int(config.get("cluster_min_samples", 4))
-        )
-        logger.info("聚类完成（主节点）")
-        if not os.path.exists(save_path):
-            torch.save(image_pseudo_labels, save_path)
-            logger.info(f"伪标签已保存至 {save_path}")
-
-    # 4) broadcast labels
-    if args.distributed:
-        labels_list = [None]
-        if rank == 0:
-            labels_list[0] = image_pseudo_labels
-        torch.distributed.broadcast_object_list(labels_list, src=0)
-        image_pseudo_labels = labels_list[0]
-
-    # 5) stats
-    num_noise = int((image_pseudo_labels == -1).sum())
-    unique_labels = set(image_pseudo_labels.tolist())
-    num_clusters = len(unique_labels) - (1 if -1 in unique_labels else 0)
-    logger.info(f"Dataset 总长度: {len(train_loader.dataset)}, 输出伪标签长度: {len(image_pseudo_labels)}")
-    logger.info(f"聚类数（不含 -1）: {num_clusters}")
-    logger.info(f"-1 数量: {num_noise}\n")
-
     return {
-        "pseudo_labels": image_pseudo_labels,
+        "pseudo_labels": train_cluster_output["pseudo_labels"],
         "feature_cache": confidence_feature_cache,
+        "monitor_labels": {
+            mode: cluster_outputs[mode]["pseudo_labels"]
+            for mode in ("image", "text")
+            if mode in cluster_outputs
+        },
+        "train_mode": train_mode,
     }
