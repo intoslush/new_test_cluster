@@ -2,11 +2,23 @@
 
 set -euo pipefail
 
-export CUDA_VISIBLE_DEVICES=0
+export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
 
 NUM_GPUS=$(echo "$CUDA_VISIBLE_DEVICES" | tr ',' '\n' | wc -l)
 DATASET_NAME="RSTPReid"
-MASTER_PORT="${MASTER_PORT:-29505}"
+EXP_DESC="${1:-RSTPReid no-cluster instance-label test: each sample uses an independent pseudo label}"
+ROOT_LOG="${2:-./output_rstp_instance.log}"
+MASTER_PORT="${MASTER_PORT:-29507}"
+
+mkdir -p "$(dirname "$ROOT_LOG")"
+exec > >(tee -a "$ROOT_LOG") 2>&1
+
+echo "[$(date '+%F %T')] Launching experiment"
+echo "Dataset: ${DATASET_NAME}"
+echo "GPUs: ${CUDA_VISIBLE_DEVICES}"
+echo "Root log: ${ROOT_LOG}"
+echo "Description: ${EXP_DESC}"
+echo "Master port: ${MASTER_PORT}"
 
 CMD=(
   torchrun
@@ -16,11 +28,13 @@ CMD=(
   --master-port="${MASTER_PORT}"
   train.py
   --name new_rasa
+  --config ./configs/PS_rstp_reid.yaml
   --checkpoint ./data/ALBEF/ALBEF.pth
   --dataset_name "${DATASET_NAME}"
   --root_dir ./re_id
-  --num_epoch 30
-  --config ./configs/PS_rstp_reid.yaml
+  --num_epoch 35
+  --cluster_id_mode instance
+  --massage "${EXP_DESC}"
 )
 
 PYTHONUNBUFFERED=1 "${CMD[@]}"

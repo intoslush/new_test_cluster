@@ -6,8 +6,8 @@ export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
 
 NUM_GPUS=$(echo "$CUDA_VISIBLE_DEVICES" | tr ',' '\n' | wc -l)
 DATASET_NAME="ICFG-PEDES"
-EXP_DESC="${1:-ICFG-PEDES baseline with cross-modal confidence calibration for pseudo supervision}"
-ROOT_LOG="${2:-./output_icfg.log}"
+EXP_DESC="${1:-ICFG-PEDES no-cluster instance-label test: each sample uses an independent pseudo label}"
+ROOT_LOG="${2:-./output_icfg_instance.log}"
 MASTER_PORT="${MASTER_PORT:-29506}"
 
 mkdir -p "$(dirname "$ROOT_LOG")"
@@ -33,7 +33,7 @@ CMD=(
   --dataset_name "${DATASET_NAME}"
   --root_dir ./re_id
   --num_epoch 35
-  --cluster_id_mode cluster
+  --cluster_id_mode instance
   --massage "${EXP_DESC}"
 )
 
