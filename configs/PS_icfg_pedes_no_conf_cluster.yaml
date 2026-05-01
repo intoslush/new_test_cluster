@@ -1,0 +1,76 @@
+train_file:  ['./re_id/ICFG-PEDES/processed_data/train.json']
+val_file: './re_id/ICFG-PEDES/processed_data/val.json'
+test_file: './re_id/ICFG-PEDES/processed_data/test.json'
+train_image_root: './re_id/ICFG-PEDES/imgs'
+val_image_root: './re_id/ICFG-PEDES/imgs'
+test_image_root: './re_id/ICFG-PEDES/imgs'
+
+bert_config: 'configs/config_bert.json'
+
+max_words: 64
+image_res: 384
+batch_size_train: 16
+batch_size_test: 64
+
+mlm_probability: 0.15
+weak_pos_pair_probability: 0.1
+mrtd_mask_probability: 0.3
+queue_size: 65536
+momentum: 0.995
+vision_width: 768
+embed_dim: 256
+temp: 0.07
+k_test: 128
+
+alpha: 0.4
+warm_up: True
+
+optimizer: {opt: adamW, lr: 1e-5, weight_decay: 0.02, lr_custm: 1e-4}
+schedular: {sched: cosine, lr: 1e-5, epochs: 35, min_lr: 2e-6, decay_rate: 1, warmup_lr: 1e-5, warmup_epochs: 1, cooldown_epochs: 0}
+
+eval_epoch: 0
+
+weights: {"loss_cl": 0.5, "loss_itm": 1, "loss_mlm": 1}
+weights_schedule:
+  freeze_epochs: 40
+  mode: "cosine"
+  normalize_sum: false
+  loss_cl:
+    min: 0
+  loss_mlm:
+    max: 1.5
+  loss_itm:
+    min: 0.2
+    max: 1.5
+
+use_momentum: True
+use_queue: True
+reset_queue_each_epoch: True
+enable_cl_loss: True
+itm_neg_sampling: 'cl'
+
+enable_mlm_loss: True
+mlm_soft_label: False
+
+cluster_feature_mode: "image"
+cluster_fusion_use_proj: False
+cluster_min_samples: 5
+cluster_eps: 0.6
+
+use_conf_calibration: False
+conf_alpha: 1.0
+conf_beta: 1.0
+conf_temp: 1.0
+conf_noise_value: 1.0
+conf_high_thres: 0.7
+conf_low_thres: 0.3
+conf_weight_id_loss: False
+conf_weight_metric_loss: False
+conf_use_text_prototype: True
+conf_debug_log: False
+conf_chunk_size: 4096
+conf_min_cluster_size: 1
+
+enable_low_conf_pair_release: False
+pair_release_warmup_epochs: 6
+enable_itm_loss: True
